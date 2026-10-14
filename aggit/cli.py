@@ -1,6 +1,6 @@
 """
 AgGit Command Line Interface (CLI).
-Exposes core version control, lock-free agent collaboration, and Git/GitHub bridge commands.
+Exposes core version control, lock-free agent collaboration, conflict resolution, and Git/GitHub bridge commands.
 """
 
 import sys
@@ -56,7 +56,17 @@ def main():
 
     # reconcile
     reconcile_parser = subparsers.add_parser("reconcile", help="Reconcile and smart-materialize state to disk")
+    reconcile_parser.add_argument("--dry-run", action="store_true", help="Preview reconciled state without modifying files")
+    reconcile_parser.add_argument("--force", action="store_true", help="Force overwrite despite local uncommitted edits")
     reconcile_parser.add_argument("--path", default=".", help="Repository directory")
+
+    # resolve
+    resolve_parser = subparsers.add_parser("resolve", help="Explicitly resolve a pending conflict on a path")
+    resolve_parser.add_argument("target_path", help="Path of the conflicted file")
+    resolve_parser.add_argument("--file", default=None, help="File containing resolved content (omit to resolve by deletion)")
+    resolve_parser.add_argument("--agent", default="resolver", help="Agent identifier")
+    resolve_parser.add_argument("-m", "--message", default=None, help="Resolution message")
+    resolve_parser.add_argument("--path", default=".", help="Repository directory")
 
     # export-preview
     preview_parser = subparsers.add_parser("export-preview", help="Dry-run preview of export to Git")
@@ -98,85 +108,91 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    repo_dir = getattr(args, "path", ".")
+    repo_dir = os.path.abspath(args.path)
 
     if args.command == "init":
         engine = AgGitEngine.init(repo_dir)
-        print(f"[AgGit] Initialized empty AgGit repository in {os.path.abspath(repo_dir)}/.aggit/")
+        print(f"[AgGit] Initialized empty AgGit repository in {engine.aggit_dir}")
 
     elif args.command == "stage":
         engine = AgGitEngine(repo_dir)
-        results = engine.staging.stage_files(args.agent, args.files, session_id=args.session)
-        print(f"[AgGit] Agent '{args.agent}' staged {len(results)} files:")
-        for f, sha in results.items():
-            print(f"  + {f} (blob: {sha[:8]})")
+        for filepath in args.files:
+            full_path = os.path.join(repo_dir, filepath) if not os.path.isabs(filepath) else filepath
+            if not os.path.exists(full_path):
+                print(f"Error: File '{filepath}' not found.", file=sys.stderr)
+                sys.exit(1)
+            rel_path = os.path.relpath(full_path, repo_dir)
+            sha = engine.stage_file(agent_id=args.agent, rel_path=rel_path, session_id=args.session)
+            print(f"[AgGit] Staged '{rel_path}' for agent '{args.agent}' (blob: {sha[:8]})")
 
     elif args.command == "stage-delete":
         engine = AgGitEngine(repo_dir)
-        for f in args.files:
-            engine.staging.stage_delete(args.agent, f, session_id=args.session)
-        print(f"[AgGit] Agent '{args.agent}' staged deletion for {len(args.files)} files.")
+        for filepath in args.files:
+            engine.stage_delete(agent_id=args.agent, rel_path=filepath, session_id=args.session)
+            print(f"[AgGit] Staged deletion of '{filepath}' for agent '{args.agent}'")
 
     elif args.command == "commit":
         engine = AgGitEngine(repo_dir)
-        tx = engine.commit(
-            agent_id=args.agent,
-            session_id=args.session,
-            message=args.message,
-            base_revision=args.base
-        )
-        print(f"[AgGit] Lock-free commit succeeded! [tx: {tx.tx_id}] by '{args.agent}'")
-        print(f"        Message: {tx.message}")
-        print(f"        Changes: {len(tx.changes)}")
-        if tx.base_revision:
-            print(f"        Base: {tx.base_revision[:8]}")
+        try:
+            tx = engine.commit(
+                agent_id=args.agent,
+                message=args.message,
+                session_id=args.session,
+                base_revision=args.base
+            )
+            print(f"[AgGit] Commit succeeded: [tx {tx.tx_id}] by '{tx.agent_id}'")
+            print(f"        Message: {tx.message}")
+            print(f"        Changes: {len(tx.changes)} file(s)")
+            if tx.base_revision:
+                print(f"        Base Revision: {tx.base_revision}")
+        except Exception as e:
+            print(f"Error committing changes: {e}", file=sys.stderr)
+            sys.exit(1)
 
     elif args.command == "status":
         engine = AgGitEngine(repo_dir)
-        staging_dir = os.path.join(engine.aggit_dir, "staging")
+        staging_dir = engine.staging.staging_dir
         staged_agents = []
         if os.path.exists(staging_dir):
-            for f in os.listdir(staging_dir):
-                if f.endswith(".json"):
-                    try:
-                        with open(os.path.join(staging_dir, f), "r", encoding="utf-8") as sfile:
-                            data = json.load(sfile)
-                            staged_agents.append(data)
-                    except Exception:
-                        pass
+            for fn in os.listdir(staging_dir):
+                if fn.endswith(".json") and not fn.startswith(".tmp_"):
+                    staged_agents.append(fn)
 
-        txs = engine.journal.get_all_transactions()
-        latest = txs[-1] if txs else None
+        latest_tx = engine.journal.get_latest_transaction()
+        all_txs = engine.journal.get_all_transactions()
+
+        # Check pending conflicts
+        cp = engine._load_latest_checkpoint()
+        pending_conflicts = cp.get("pending_conflicts", [])
 
         if args.json:
-            out = {
-                "active_staging_sessions": staged_agents,
-                "total_transactions": len(txs),
-                "latest_tx": latest.to_dict() if latest else None
+            status_data = {
+                "active_staging_files": len(staged_agents),
+                "total_transactions": len(all_txs),
+                "latest_transaction": latest_tx.to_dict() if latest_tx else None,
+                "pending_conflicts_count": len(pending_conflicts),
+                "pending_conflicts": pending_conflicts
             }
-            print(json.dumps(out, indent=2))
+            print(json.dumps(status_data, indent=2))
         else:
-            print("[AgGit Status]")
-            if staged_agents:
-                print(f"Active Staging Sessions ({len(staged_agents)}):")
-                for s in staged_agents:
-                    entries = s.get("entries", {})
-                    print(f"  Agent: {s.get('agent_id')} (session: {s.get('session_id')}, gen: {s.get('generation')}, {len(entries)} files)")
-                    for path, cr in entries.items():
-                        sha = cr.get("blob_sha") or "deleted"
-                        print(f"    - [{cr.get('action')}] {path} -> {sha[:8]}")
+            print(f"[AgGit Status - {repo_dir}]")
+            print(f"Total Transactions: {len(all_txs)}")
+            if latest_tx:
+                print(f"Latest Revision:    {latest_tx.tx_id} by '{latest_tx.agent_id}' ({latest_tx.message})")
             else:
-                print("  No active staging sessions.")
-
-            print(f"\nTotal Recorded Transactions in Journal: {len(txs)}")
-            if latest:
-                print(f"HEAD: [{latest.tx_id[:8]}] by '{latest.agent_id}': {latest.message}")
+                print("Latest Revision:    genesis (no commits yet)")
+            print(f"Active Staged Sessions: {len(staged_agents)}")
+            if pending_conflicts:
+                print(f"Pending Conflicts:  {len(pending_conflicts)} file(s) require explicit resolution:")
+                for c in pending_conflicts:
+                    print(f"  ! {c.get('path')} ({c.get('conflict_type')})")
+            else:
+                print("Pending Conflicts:  0 (clean)")
 
     elif args.command == "log":
         engine = AgGitEngine(repo_dir)
         txs = engine.journal.get_all_transactions()
         selected = txs[-args.limit:] if args.limit else txs
-
         if args.json:
             print(json.dumps([t.to_dict() for t in reversed(selected)], indent=2))
         else:
@@ -192,14 +208,46 @@ def main():
 
     elif args.command == "reconcile":
         engine = AgGitEngine(repo_dir)
-        count, conflicts = engine.materialize()
-        print(f"[AgGit] Reconciled and materialized {count} files to working tree.")
-        if conflicts:
-            print(f"WARNING: Found {len(conflicts)} files with conflicts:")
+        if args.dry_run:
+            files, conflicts = engine.reconcile_state(dry_run=True)
+            print(f"[AgGit Dry-run] Reconciled in-memory: {len(files)} files, {len(conflicts)} conflict(s).")
             for c in conflicts:
                 print(f"  ! {c.path} ({c.conflict_type}: {c.details})")
         else:
-            print("Status: 100% clean merge across all agent mutations.")
+            try:
+                count, conflicts = engine.materialize(force=args.force)
+                print(f"[AgGit] Reconciled and materialized {count} files to working tree.")
+                if conflicts:
+                    print(f"WARNING: Found {len(conflicts)} files with conflicts:")
+                    for c in conflicts:
+                        print(f"  ! {c.path} ({c.conflict_type}: {c.details})")
+                else:
+                    print("Status: 100% clean merge across all agent mutations.")
+            except Exception as e:
+                print(f"Error during materialization: {e}", file=sys.stderr)
+                sys.exit(1)
+
+    elif args.command == "resolve":
+        engine = AgGitEngine(repo_dir)
+        resolved_bytes = None
+        if args.file:
+            if not os.path.exists(args.file):
+                print(f"Error: Resolution source file '{args.file}' not found.", file=sys.stderr)
+                sys.exit(1)
+            with open(args.file, "rb") as f:
+                resolved_bytes = f.read()
+
+        try:
+            tx = engine.resolve_conflict(
+                path=args.target_path,
+                resolved_bytes=resolved_bytes,
+                agent_id=args.agent,
+                message=args.message
+            )
+            print(f"[AgGit] Conflict on '{args.target_path}' successfully resolved via tx {tx.tx_id[:8]}.")
+        except Exception as e:
+            print(f"Error resolving conflict: {e}", file=sys.stderr)
+            sys.exit(1)
 
     elif args.command == "export-preview":
         engine = AgGitEngine(repo_dir)
@@ -227,6 +275,8 @@ def main():
         print(f"        Message: {result.message}")
         if result.details:
             print(f"        Details: {json.dumps(result.details, indent=2)}")
+        if result.status in ("conflict", "failed"):
+            sys.exit(1)
 
     elif args.command == "push":
         engine = AgGitEngine(repo_dir)
@@ -235,10 +285,9 @@ def main():
         if res.get("success"):
             print(f"[AgGit] Successfully pushed branch '{res['branch']}' to remote '{res['remote']}'.")
         else:
-            print(f"[AgGit] Push failed: {res.get('error')}")
-            print(f"        {res.get('guidance')}")
-            if res.get("stderr"):
-                print(f"        stderr: {res['stderr']}")
+            print(f"[AgGit] Push failed: {res.get('error')}", file=sys.stderr)
+            print(f"        {res.get('message')}", file=sys.stderr)
+            sys.exit(1)
 
     elif args.command == "pr":
         engine = AgGitEngine(repo_dir)
@@ -253,14 +302,20 @@ def main():
         print(f"           Message: {res.get('message')}")
         if res.get("pr_url"):
             print(f"           URL: {res.get('pr_url')}")
-        if res.get("guidance"):
-            print(f"           Guidance: {res.get('guidance')}")
+        if res.get("action_required"):
+            print(f"           Action Required: {res.get('action_required')}")
+        if res.get("status") == "failed":
+            sys.exit(1)
 
     elif args.command == "import-git":
         engine = AgGitEngine(repo_dir)
         bridge = GitBridge(engine)
-        tx_id = bridge.import_from_git(commit_ref=args.ref)
-        print(f"[AgGit] Successfully imported Git snapshot from '{args.ref}' as AgGit revision: {tx_id}")
+        try:
+            tx_id = bridge.import_from_git(commit_ref=args.ref)
+            print(f"[AgGit] Successfully imported Git snapshot from '{args.ref}' as AgGit revision: {tx_id}")
+        except Exception as e:
+            print(f"Error importing from Git: {e}", file=sys.stderr)
+            sys.exit(1)
 
 if __name__ == "__main__":
     main()

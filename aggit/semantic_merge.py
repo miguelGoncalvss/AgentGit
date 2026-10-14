@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import os
 import difflib
+import hashlib
 from dataclasses import dataclass
 from typing import Tuple, Dict, Any, List, Optional
 
@@ -22,6 +23,44 @@ class MergeConflict:
     path: str
     conflict_type: str  # "modify_delete", "binary", "text_overlap", "json_key"
     details: str
+    base_sha: Optional[str] = None
+    a_sha: Optional[str] = None
+    b_sha: Optional[str] = None
+    label_a: Optional[str] = None
+    label_b: Optional[str] = None
+    conflict_id: Optional[str] = None
+
+    def __post_init__(self):
+        if not self.conflict_id:
+            raw = f"{self.path}::{self.conflict_type}::{self.base_sha}::{self.a_sha}::{self.b_sha}"
+            self.conflict_id = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "conflict_id": self.conflict_id,
+            "path": self.path,
+            "conflict_type": self.conflict_type,
+            "details": self.details,
+            "base_sha": self.base_sha,
+            "a_sha": self.a_sha,
+            "b_sha": self.b_sha,
+            "label_a": self.label_a,
+            "label_b": self.label_b
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "MergeConflict":
+        return cls(
+            path=d.get("path", ""),
+            conflict_type=d.get("conflict_type", "unknown"),
+            details=d.get("details", ""),
+            base_sha=d.get("base_sha"),
+            a_sha=d.get("a_sha"),
+            b_sha=d.get("b_sha"),
+            label_a=d.get("label_a"),
+            label_b=d.get("label_b"),
+            conflict_id=d.get("conflict_id")
+        )
 
 def is_binary_bytes(data: bytes) -> bool:
     """Checks if data contains null bytes or fails UTF-8 decoding."""
@@ -49,6 +88,9 @@ class SemanticMerger:
         If merged_bytes is None, the file was cleanly deleted.
         """
         conflicts: List[MergeConflict] = []
+        base_sha = hashlib.sha256(base_bytes).hexdigest() if base_bytes is not None else None
+        a_sha = hashlib.sha256(a_bytes).hexdigest() if a_bytes is not None else None
+        b_sha = hashlib.sha256(b_bytes).hexdigest() if b_bytes is not None else None
 
         # 1. No changes on either side
         if a_bytes == base_bytes and b_bytes == base_bytes:
@@ -70,12 +112,30 @@ class SemanticMerger:
         # Case 5a: Modify / Delete conflict
         if a_bytes is None and b_bytes is not None:
             # A deleted, B modified
-            conflicts.append(MergeConflict(path=path, conflict_type="modify_delete", details="File deleted by A but modified by B"))
+            conflicts.append(MergeConflict(
+                path=path,
+                conflict_type="modify_delete",
+                details="File deleted by A but modified by B",
+                base_sha=base_sha,
+                a_sha=a_sha,
+                b_sha=b_sha,
+                label_a=label_a,
+                label_b=label_b
+            ))
             return b_bytes, conflicts
 
         if b_bytes is None and a_bytes is not None:
             # B deleted, A modified
-            conflicts.append(MergeConflict(path=path, conflict_type="modify_delete", details="File deleted by B but modified by A"))
+            conflicts.append(MergeConflict(
+                path=path,
+                conflict_type="modify_delete",
+                details="File deleted by B but modified by A",
+                base_sha=base_sha,
+                a_sha=a_sha,
+                b_sha=b_sha,
+                label_a=label_a,
+                label_b=label_b
+            ))
             return a_bytes, conflicts
 
         # Both a_bytes and b_bytes are present
@@ -84,7 +144,16 @@ class SemanticMerger:
         # Check binary status
         is_binary = is_binary_bytes(a_bytes) or is_binary_bytes(b_bytes) or (base_bytes is not None and is_binary_bytes(base_bytes))
         if is_binary:
-            conflicts.append(MergeConflict(path=path, conflict_type="binary", details="Binary file modified concurrently with different contents"))
+            conflicts.append(MergeConflict(
+                path=path,
+                conflict_type="binary",
+                details="Binary file modified concurrently with different contents",
+                base_sha=base_sha,
+                a_sha=a_sha,
+                b_sha=b_sha,
+                label_a=label_a,
+                label_b=label_b
+            ))
             return b_bytes, conflicts
 
         # Textual / Structured merge
@@ -102,6 +171,12 @@ class SemanticMerger:
                 b_obj = json.loads(b_str)
                 merged_obj, json_conflicts = SemanticMerger.merge_json_recursive(base_obj, a_obj, b_obj, path)
                 if json_conflicts:
+                    for jc in json_conflicts:
+                        jc.base_sha = base_sha
+                        jc.a_sha = a_sha
+                        jc.b_sha = b_sha
+                        jc.label_a = label_a
+                        jc.label_b = label_b
                     conflicts.extend(json_conflicts)
                 merged_bytes = json.dumps(merged_obj, indent=2, sort_keys=True).encode("utf-8") + b"\n"
                 return merged_bytes, conflicts
@@ -112,6 +187,12 @@ class SemanticMerger:
         # Text / Python 3-way merge
         merged_text, text_conflicts = SemanticMerger.merge_text_3way(base_str, a_str, b_str, path, label_a, label_b)
         if text_conflicts:
+            for tc in text_conflicts:
+                tc.base_sha = base_sha
+                tc.a_sha = a_sha
+                tc.b_sha = b_sha
+                tc.label_a = label_a
+                tc.label_b = label_b
             conflicts.extend(text_conflicts)
 
         return merged_text.encode("utf-8"), conflicts
