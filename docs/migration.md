@@ -25,3 +25,16 @@ O AgGit foi projetado para manter retrocompatibilidade com repositórios e event
    Eventos legados no journal `.aggit/journal/` não são reescritos nem destruídos. Novos commits geram eventos no schema v2.
 3. **Compatibilidade dos Blobs CAS**:
    O formato dos objetos armazenados no CAS (`.aggit/objects/`) permanece 100% idêntico entre v1 e v2: cabeçalho `[tipo] [tamanho]\0` comprimido com zlib e endereçado por SHA-256.
+
+---
+
+## 3. Evolução dos Checkpoints e Auto-recuperação
+
+### 3.1 Checkpoints Legados (Schema v1)
+No schema v1 de checkpoints (`.aggit/checkpoints/latest.json`), o arquivo registrava apenas `tree` e `processed_tx_ids`. Se um conflito ocorresse em execuções antigas, ele não era persistido estruturadamente, arriscando perda de contexto em reinicializações de processo.
+
+### 3.2 Migração para Checkpoint Schema v2
+- **Compatibilidade de Leitura**: Ao carregar um checkpoint sem o campo `"pending_conflicts"`, o motor atribui automaticamente uma lista vazia `[]`, mantendo compatibilidade direta.
+- **Detecção e Preservação**: Novos conflitos detectados durante a reconciliação são persistidos estruturadamente no schema v2 com metadados completos (`path`, `base_sha`, `ours_sha`, `theirs_sha`, `conflict_type`).
+- **Auto-recuperação Baseada no Journal**: Caso um checkpoint antigo tenha sido gravado de forma inconsistente ou corrompido, a recuperação utiliza o append-only journal (`.aggit/journal/`) como fonte imutável da verdade. Ao apagar ou invalidar o arquivo de checkpoint, a execução de `aggit reconcile` reprocessa o histórico causal segundo o DAG de transações, restabelecendo a árvore unificada e re-detectando quaisquer conflitos não resolvidos.
+

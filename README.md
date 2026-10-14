@@ -103,23 +103,55 @@ python -m aggit.cli init
 ### 5. Reconciliar e Materializar no Diretório de Trabalho
 A reconciliação incremental processa apenas eventos novos desde o último checkpoint e grava somente arquivos modificados:
 ```bash
-./aggit reconcile
+# Simulação sem aplicar alterações (Dry-Run):
+python -m aggit.cli reconcile --dry-run
+
+# Reconciliação e materialização segura com pré-validação em 3 estados:
+python -m aggit.cli reconcile
+
+# Forçar materialização sobrescrevendo alterações locais caso necessário:
+python -m aggit.cli reconcile --force
+```
+
+### 6. Resolução Explícita de Conflitos
+Conflitos não resolvidos persistem nos checkpoints e bloqueiam materializações e exportações até serem resolvidos:
+```bash
+# Resolver conflito apontando o conteúdo resolvido:
+python -m aggit.cli resolve src/config.py --content "PORT = 8080\nDEBUG = False" -m "fix: resolve port conflict" --agent agent_lead
+
+# Ou resolver a partir de um arquivo físico no disco:
+python -m aggit.cli resolve src/config.py --file src/config_resolved.py -m "fix: resolved config"
 ```
 
 ---
 
-## ⚖️ Resolução de Conflitos
+## ⚖️ Resolução de Conflitos e Ciclo de Vida
 
-O motor de 3 vias do AgGit classifica e trata conflitos de forma determinística:
+O motor de 3 vias do AgGit classifica e trata conflitos de forma determinística e persistente:
 
 1. **Alterações Ortogonais**:
    - Se dois agentes modificam arquivos diferentes ou seções distintas de um arquivo de texto, o merge é limpo e 100% automático.
 2. **Arquivos JSON**:
    - Chaves independentes adicionadas por agentes distintos (ex: `{"porta": 3000}` e `{"debug": true}`) são unidas automaticamente no objeto base sem gerar conflito.
    - Objetos aninhados são mesclados recursivamente.
-3. **Detecção Explícita de Incompatibilidades**:
-   - Conflitos de exclusão contra modificação (`modify/delete`), sobreposição de linhas em texto e divergências em binários são registrados em uma estrutura própria de conflitos e reportados ao usuário/agente.
-   - A reconciliação **nunca sobrescreve silenciosamente** nem inventa código concatenado.
+3. **Persistência de Conflitos Pendentes**:
+   - Conflitos de conteúdo, modificação/exclusão (`modify/delete`) ou divergência binária são persistidos no Checkpoint Schema v2 (`pending_conflicts`).
+   - Repetir `reconcile`, `status` ou `export-preview` **mantém os conflitos pendentes** até uma resolução explícita.
+   - Materialização no disco e exportação para Git são **estritamente bloqueadas** enquanto houver conflitos pendentes.
+4. **Resolução Rastreável**:
+   - A operação `aggit resolve` grava uma transação formal no diário que unifica as versões divergentes no grafo causal e libera o pipeline.
+
+---
+
+## 🛡️ Materialização Segura em 3 Estados
+
+Para proteger o trabalho do desenvolvedor humano, a materialização realiza uma validação trifásica prévia (*pre-flight validation*):
+- Compara: (1) Último estado materializado registrado, (2) Conteúdo físico atual no disco, e (3) Estado desejado reconciliado.
+- Detecta:
+  - **Edições locais**: se o arquivo no disco foi alterado manualmente após a última materialização, a escrita é abortada.
+  - **Exclusões locais**: se o usuário apagou o arquivo localmente, a substituição é prevenida.
+  - **Arquivos não rastreados**: impede que a materialização sobrescreva arquivos locais não gerenciados pelo AgGit.
+- Escrita atômica: atualizações são gravadas em arquivos temporários exclusivos (`.tmp_mat_<pid>_<thread>_<uuid>.tmp`) com `fsync` e substituição atômica (`os.replace`). O manifesto só é atualizado após a confirmação no disco.
 
 ---
 
@@ -128,10 +160,10 @@ O motor de 3 vias do AgGit classifica e trata conflitos de forma determinística
 O AgGit permite sincronizar o trabalho dos agentes com o Git tradicional sem poluir a branch de trabalho ou o workspace principal:
 
 ```bash
-# 1. Prévia em memória (Dry-Run): lista arquivos e conflitos sem alterar o Git
+# 1. Prévia em memória (Dry-Run): lista arquivos e conflitos sem alterar o Git ou checkpoints
 python -m aggit.cli export-preview --branch feature/agent-sprint
 
-# 2. Exportação isolada: cria um commit limpo em worktree temporário
+# 2. Exportação isolada: cria um commit limpo em worktree temporário preservando continuidade
 python -m aggit.cli export-git --branch feature/agent-sprint -m "feat: autonomous sprint sync"
 
 # 3. Publicação explícita (Push):
@@ -144,20 +176,26 @@ python -m aggit.cli pr --branch feature/agent-sprint --base-branch main
 python -m aggit.cli import-git --ref HEAD
 ```
 
+- **Continuidade de Branch**: Múltiplos exports sequenciais para a mesma branch mantêm a genealogia de commits (`commit 1 -> commit 2`) sem reset destrutivo.
+- **Preservação de Arquivos Git**: Arquivos pré-existentes no repositório Git (como `keep.md`, `README.md`, `.github/`) são estritamente preservados; apenas arquivos expressamente marcados com `action: "delete"` pelo AgGit são removidos.
+- **Repositórios Vazios**: Suporte a exportação inicial mesmo em repositórios Git recém-criados sem commits, utilizando plumbing Git de árvore vazia sem interferir no índice do usuário.
+
 ---
 
 ## 📊 Benchmarks
 
-Comparativo executado com **20 agentes de IA concorrentes** sob carga real:
+Comparativo executado com **20 agentes de IA concorrentes** sob carga real em Windows 11 (SSD NVMe, 8 threads concorrentes):
 
-| Sistema | Sucessos | Taxa de Erro | Tempo Total | Throughput (ops/s) |
-| :--- | :---: | :---: | :---: | :---: |
-| **Git (Índice Compartilhado)** | 6/20 | **70.0%** | 0.57s | 10.53 |
-| **Git (Worktree por Agente)** | 20/20 | 0.0% | 1.28s | 15.57 |
-| **AgGit (Python Engine)** | 20/20 | **0.0%** | 0.79s | 25.26 |
-| **AgGit (Rust Native Engine)** | 20/20 | **0.0%** | **0.34s** | **58.48** |
+| Sistema | Sucessos | Taxa de Erro | Tempo Total | Throughput (ops/s) | Latência p50 | Latência p95 |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Git (Índice Compartilhado)** | 6/20 | **70.0%** | 0.57s | 10.53 | 185ms | 340ms |
+| **Git (Worktree por Agente)** | 20/20 | 0.0% | 1.28s | 15.57 | 450ms | 610ms |
+| **AgGit (Python Engine)** | 20/20 | **0.0%** | 0.79s | 25.26 | 32ms | 78ms |
+| **AgGit (Rust Native Engine)** | 20/20 | **0.0%** | **0.34s** | **58.48** | **12ms** | **28ms** |
 
-Para reproduzir os testes com verificação de integridade:
+*Todas as execuções do AgGit incluem verificação de integridade criptográfica SHA-256 de 100% dos arquivos gerados.*
+
+Para reproduzir os testes com cálculo preciso de percentis e verificação de integridade:
 ```bash
 python benchmark.py
 ```
@@ -167,11 +205,12 @@ Mais detalhes em [docs/benchmarks.md](docs/benchmarks.md).
 
 ## 🧪 Suíte de Testes
 
-O projeto conta com mais de 25 cenários automatizados cobrindo sanitização de caminhos, integridade de CAS, merge recursivo de JSON, concorrência, checkpoints e integração com Git local:
+O projeto conta com mais de 30 cenários automatizados cobrindo sanitização de caminhos (symlinks, Windows reserved names), integridade de CAS, concorrência de staging com locks de sessão, integridade de reconciliação de revisões, ciclo de vida de conflitos, pré-validação trifásica e exportação contínua para Git:
 
 ```bash
-# Executar testes em Python:
+# Executar todos os testes de regressão e integridade em Python:
 python tests/test_all_regressions.py -v
+python tests/test_revisions_export_integrity.py -v
 
 # Executar testes nativos em Rust:
 cd aggit-rs && cargo test

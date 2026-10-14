@@ -84,17 +84,67 @@ Localização: `.aggit/staging/<agent_safe_prefix>_<ident_hash>.json`
 
 Localização: `.aggit/checkpoints/latest.json`
 
+### 4.1 Schema Version 2 (Canônico Atual)
 ```json
 {
-  "version": 1,
+  "version": 2,
   "tree": {
-    "src/auth.py": "a1b2c3d4...",
-    "package.json": "88776655..."
+    "src/auth.py": "a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef0",
+    "package.json": "887766554433221100ffeeddccbbaa99887766554433221100ffeeddccbbaa99"
   },
   "processed_tx_ids": [
-    "tx-1",
-    "tx-2",
-    "tx-3"
+    "c9bf9e57-1685-4c89-bafb-ff5af830be8a",
+    "f2a7b1c8-e994-d229-21ab-c015f8d90210"
+  ],
+  "pending_conflicts": [
+    {
+      "path": "src/config.py",
+      "base_sha": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "ours_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef0",
+      "theirs_sha": "f1e2d3c4b5a60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef0",
+      "ours_tx_id": "c9bf9e57-1685-4c89-bafb-ff5af830be8a",
+      "theirs_tx_id": "f2a7b1c8-e994-d229-21ab-c015f8d90210",
+      "conflict_type": "content_divergence",
+      "description": "Conflict in src/config.py: divergent modifications"
+    }
   ]
+}
+```
+
+---
+
+## 5. Ledger de Exportação para Git
+
+Localização: `.aggit/git_export_map.json`
+
+Mapeia o estado exportado para os commits equivalentes no Git local.
+
+### 5.1 Formato da Chave Composta
+Para garantir rastreabilidade, continuidade de branch e independência entre ramificações, a chave do ledger segue a estrutura:
+```
+<revision_id>::<git_branch>::<parent_git_commit>
+```
+Exemplo:
+```json
+{
+  "c9bf9e57-1685-4c89-bafb-ff5af830be8a::feature/agent-sprint::": "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+  "d1a2b3c4-5e6f-7a8b-9c0d-1e2f3a4b5c6d::feature/agent-sprint::4b825dc642cb6eb9a060e54bf8d69288fbee4904": "8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b"
+}
+```
+
+---
+
+## 6. Manifesto de Materialização no Disco
+
+Localização: `.aggit/materialized_state.json`
+
+Registra a relação de arquivos gravados no diretório de trabalho na última materialização bem-sucedida, permitindo a detecção de edições locais em 3 estados:
+```json
+{
+  "tracked_files": {
+    "src/auth.py": "a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef0",
+    "package.json": "887766554433221100ffeeddccbbaa99887766554433221100ffeeddccbbaa99"
+  },
+  "last_reconciled_tx": "c9bf9e57-1685-4c89-bafb-ff5af830be8a"
 }
 ```
