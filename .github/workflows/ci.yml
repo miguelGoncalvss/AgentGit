@@ -2,15 +2,16 @@ name: AgGit CI
 
 on:
   push:
-    branches: [ main, "feat/**" ]
+    branches: [ main, "feat/**", "fix/**" ]
   pull_request:
     branches: [ main ]
 
 jobs:
   test-matrix:
-    name: Build & Test (${{ matrix.os }})
+    name: Build & Test (${{ matrix.os }} - Py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ ubuntu-latest, windows-latest ]
         python-version: [ "3.11", "3.12" ]
@@ -34,21 +35,26 @@ jobs:
         run: |
           git config --global user.name "AgGit CI"
           git config --global user.email "ci@aggit.local"
+          git config --global init.defaultBranch main
 
-      - name: Run Python Regression Tests
+      - name: Run Python Core Regression Suite
         run: |
           python tests/test_all_regressions.py -v
 
-      - name: Build Rust Engine
+      - name: Run Python Integrity & Export Regression Suite
+        run: |
+          python tests/test_revisions_export_integrity.py -v
+
+      - name: Build Rust Engine (Locked)
         working-directory: ./aggit-rs
         run: |
-          cargo build --release
+          cargo build --release --locked
 
-      - name: Run Rust Tests
+      - name: Run Rust Integration Tests (Locked)
         working-directory: ./aggit-rs
         run: |
-          cargo test --verbose
+          cargo test --verbose --locked
 
-      - name: Run Sanity Benchmark
+      - name: Run Multi-Agent Benchmark Smoke Test
         run: |
           python benchmark.py
