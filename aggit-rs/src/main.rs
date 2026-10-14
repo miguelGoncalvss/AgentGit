@@ -1,18 +1,12 @@
-mod storage;
-mod journal;
-mod staging;
-mod semantic;
-mod engine;
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 use clap::{Parser, Subcommand};
 use rayon::prelude::*;
-use engine::AgGitEngine;
+use aggit::engine::AgGitEngine;
 
 #[derive(Parser)]
-#[command(name = "aggit", version = "0.1.0", about = "AgGit: Rust-Native Lock-Free Version Control System for AI Agents")]
+#[command(name = "aggit", version = "0.2.0", about = "AgGit: Rust-Native Lock-Free Version Control System for AI Agents")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -30,6 +24,18 @@ enum Commands {
         file: String,
         #[arg(short, long)]
         agent: String,
+        #[arg(short, long)]
+        session: Option<String>,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Stage deletion of a file
+    StageDelete {
+        file: String,
+        #[arg(short, long)]
+        agent: String,
+        #[arg(short, long)]
+        session: Option<String>,
         #[arg(default_value = ".")]
         path: PathBuf,
     },
@@ -39,6 +45,10 @@ enum Commands {
         message: String,
         #[arg(short, long)]
         agent: String,
+        #[arg(short, long)]
+        session: Option<String>,
+        #[arg(short, long)]
+        base: Option<String>,
         #[arg(default_value = ".")]
         path: PathBuf,
     },
@@ -52,12 +62,12 @@ enum Commands {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
-    /// Reconcile and parallel materialize state
+    /// Reconcile and smart-materialize state to disk
     Reconcile {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
-    /// Run ultra-fast native concurrency benchmark
+    /// Run native concurrency benchmark
     Benchmark {
         #[arg(short, long, default_value_t = 50)]
         agents: usize,
@@ -72,21 +82,26 @@ fn main() -> std::io::Result<()> {
             let engine = AgGitEngine::init(&path)?;
             println!("[AgGit-RS] Initialized empty AgGit repository in {:?}", engine.repo_dir.join(".aggit"));
         }
-        Commands::Stage { file, agent, path } => {
+        Commands::Stage { file, agent, session, path } => {
             let engine = AgGitEngine::new(&path);
             let sha = engine.staging.stage_file(&engine.storage, &agent, &file, None)?;
-            println!("[AgGit-RS] Agent '{}' staged '{}' (blob: {})", agent, file, &sha[..8]);
+            println!("[AgGit-RS] Agent '{}' (session: {:?}) staged '{}' (blob: {})", agent, session, file, &sha[..8]);
         }
-        Commands::Commit { message, agent, path } => {
+        Commands::StageDelete { file, agent, session, path } => {
             let engine = AgGitEngine::new(&path);
-            let tx = engine.commit(&agent, &message, None)?;
+            engine.staging.stage_delete(&agent, &file, session.as_deref())?;
+            println!("[AgGit-RS] Agent '{}' staged deletion of '{}'", agent, file);
+        }
+        Commands::Commit { message, agent, session, base, path } => {
+            let engine = AgGitEngine::new(&path);
+            let tx = engine.commit(&agent, session.as_deref(), &message, None, base, None)?;
             println!("[AgGit-RS] Lock-free commit succeeded! [tx: {}] by '{}'", tx.tx_id, agent);
             println!("           Message: {}", tx.message);
-            println!("           Files: {}", tx.files.len());
+            println!("           Changes: {}", tx.get_effective_changes().len());
         }
         Commands::Status { path } => {
             let engine = AgGitEngine::new(&path);
-            let txs = engine.journal.get_all_transactions();
+            let txs = engine.journal.get_all_transactions().unwrap_or_default();
             println!("[AgGit-RS Status]");
             println!("Total recorded transactions: {}", txs.len());
             if let Some(latest) = txs.last() {
@@ -95,12 +110,13 @@ fn main() -> std::io::Result<()> {
         }
         Commands::Log { path } => {
             let engine = AgGitEngine::new(&path);
-            let txs = engine.journal.get_all_transactions();
+            let txs = engine.journal.get_all_transactions().unwrap_or_default();
             println!("[AgGit-RS Log - {} transactions]", txs.len());
             for tx in txs.iter().rev() {
                 println!("* tx {} | Agent: {} | Nanos: {}", tx.tx_id, tx.agent_id, tx.timestamp_ns);
                 println!("  Message: {}", tx.message);
-                let files: Vec<&str> = tx.files.keys().map(|s| s.as_str()).collect();
+                let changes = tx.get_effective_changes();
+                let files: Vec<&str> = changes.keys().map(|s| s.as_str()).collect();
                 println!("  Files: {}", files.join(", "));
                 println!();
             }
@@ -108,9 +124,12 @@ fn main() -> std::io::Result<()> {
         Commands::Reconcile { path } => {
             let engine = AgGitEngine::new(&path);
             let (count, conflicts) = engine.materialize()?;
-            println!("[AgGit-RS] Parallel materialized {} files into working directory.", count);
+            println!("[AgGit-RS] Reconciled and materialized {} files into working directory.", count);
             if !conflicts.is_empty() {
-                println!("WARNING: Conflicts found in: {:?}", conflicts);
+                println!("WARNING: Conflicts found in {} files:", conflicts.len());
+                for c in &conflicts {
+                    println!("  ! {} ({}: {})", c.path, c.conflict_type, c.details);
+                }
             } else {
                 println!("Status: 100% clean merge.");
             }
@@ -135,7 +154,7 @@ fn main() -> std::io::Result<()> {
                     let content = format!("// Generated by agent {}\nfn worker_{}() {{ println!(\"ok\"); }}\n", i, i);
                     files.insert(format!("src/worker_{}.rs", i), content.into_bytes());
 
-                    match engine.commit(&agent_id, &format!("Agent {} commit", i), Some(files)) {
+                    match engine.commit(&agent_id, None, &format!("Agent {} commit", i), Some(files), None, None) {
                         Ok(_) => 1,
                         Err(_) => 0,
                     }
