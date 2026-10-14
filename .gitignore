@@ -18,5 +18,6 @@ ENV/
 benchmark_env/
 bench_rust_repo/
 test_run/
+benchmark_results.json
 *.tmp
 .tmp_*
