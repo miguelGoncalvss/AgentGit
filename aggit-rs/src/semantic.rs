@@ -1,207 +1,271 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+use std::process::Command;
+use std::fs::File;
+use std::io::Write;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeConflict {
+    pub path: String,
+    pub conflict_type: String,
+    pub details: String,
+}
 
 pub struct SemanticMerger;
 
+fn is_binary(bytes: &[u8]) -> bool {
+    let check_len = bytes.len().min(8192);
+    if bytes[..check_len].contains(&0) {
+        return true;
+    }
+    std::str::from_utf8(bytes).is_err()
+}
+
 impl SemanticMerger {
-    pub fn merge_content(base: &str, a: &str, b: &str, filename: &str) -> (String, bool) {
-        if a == base {
-            return (b.to_string(), false);
-        }
-        if b == base {
-            return (a.to_string(), false);
-        }
-        if a == b {
-            return (a.to_string(), false);
+    pub fn merge_files(
+        path: &str,
+        base_bytes: Option<&[u8]>,
+        a_bytes: Option<&[u8]>,
+        b_bytes: Option<&[u8]>,
+        label_a: &str,
+        label_b: &str,
+    ) -> (Option<Vec<u8>>, Vec<MergeConflict>) {
+        let mut conflicts = Vec::new();
+
+        // 1. Both unchanged
+        if a_bytes == base_bytes && b_bytes == base_bytes {
+            return (base_bytes.map(|b| b.to_vec()), conflicts);
         }
 
-        let ext = filename.split('.').last().unwrap_or("").to_lowercase();
-
-        match ext.as_str() {
-            "py" => Self::merge_python_like(base, a, b),
-            "json" => Self::merge_json(base, a, b),
-            _ => Self::merge_text_hunks(base, a, b),
+        // 2. Both sides made identical change (including both deleting)
+        if a_bytes == b_bytes {
+            return (a_bytes.map(|b| b.to_vec()), conflicts);
         }
+
+        // 3. Only A changed (B unchanged from base)
+        if b_bytes == base_bytes {
+            return (a_bytes.map(|b| b.to_vec()), conflicts);
+        }
+
+        // 4. Only B changed (A unchanged from base)
+        if a_bytes == base_bytes {
+            return (b_bytes.map(|b| b.to_vec()), conflicts);
+        }
+
+        // 5. Both changed differently
+        // Modify / Delete conflicts
+        if a_bytes.is_none() && b_bytes.is_some() {
+            conflicts.push(MergeConflict {
+                path: path.to_string(),
+                conflict_type: "modify_delete".to_string(),
+                details: "File deleted by A but modified by B".to_string(),
+            });
+            return (b_bytes.map(|b| b.to_vec()), conflicts);
+        }
+
+        if b_bytes.is_none() && a_bytes.is_some() {
+            conflicts.push(MergeConflict {
+                path: path.to_string(),
+                conflict_type: "modify_delete".to_string(),
+                details: "File deleted by B but modified by A".to_string(),
+            });
+            return (a_bytes.map(|b| b.to_vec()), conflicts);
+        }
+
+        let a = a_bytes.unwrap();
+        let b = b_bytes.unwrap();
+
+        // Binary file check
+        if is_binary(a) || is_binary(b) || base_bytes.map_or(false, is_binary) {
+            conflicts.push(MergeConflict {
+                path: path.to_string(),
+                conflict_type: "binary".to_string(),
+                details: "Binary file modified concurrently with different contents".to_string(),
+            });
+            return (Some(b.to_vec()), conflicts);
+        }
+
+        let a_str = match std::str::from_utf8(a) {
+            Ok(s) => s,
+            Err(_) => return (Some(b.to_vec()), conflicts),
+        };
+        let b_str = match std::str::from_utf8(b) {
+            Ok(s) => s,
+            Err(_) => return (Some(b.to_vec()), conflicts),
+        };
+        let base_str = base_bytes.and_then(|b| std::str::from_utf8(b).ok()).unwrap_or("");
+
+        let ext = path.split('.').last().unwrap_or("").to_lowercase();
+
+        if ext == "json" {
+            if let (Ok(val_a), Ok(val_b)) = (serde_json::from_str::<serde_json::Value>(a_str), serde_json::from_str::<serde_json::Value>(b_str)) {
+                let val_base = serde_json::from_str::<serde_json::Value>(base_str).unwrap_or(serde_json::Value::Object(Default::default()));
+                let (merged_val, json_conflicts) = Self::merge_json_recursive(&val_base, &val_a, &val_b, path);
+                conflicts.extend(json_conflicts);
+                if let Ok(mut json_bytes) = serde_json::to_vec_pretty(&merged_val) {
+                    json_bytes.push(b'\n');
+                    return (Some(json_bytes), conflicts);
+                }
+            }
+        }
+
+        // Textual 3-way merge
+        let (merged_text, text_conflicts) = Self::merge_text_3way(base_str, a_str, b_str, path, label_a, label_b);
+        conflicts.extend(text_conflicts);
+        (Some(merged_text.into_bytes()), conflicts)
     }
 
-    fn merge_json(base: &str, a: &str, b: &str) -> (String, bool) {
-        let val_base: serde_json::Value = serde_json::from_str(base).unwrap_or(serde_json::Value::Object(Default::default()));
-        let val_a: serde_json::Value = serde_json::from_str(a).unwrap_or(serde_json::Value::Object(Default::default()));
-        let val_b: serde_json::Value = serde_json::from_str(b).unwrap_or(serde_json::Value::Object(Default::default()));
+    pub fn merge_json_recursive(
+        base_val: &serde_json::Value,
+        a_val: &serde_json::Value,
+        b_val: &serde_json::Value,
+        path: &str,
+    ) -> (serde_json::Value, Vec<MergeConflict>) {
+        let mut conflicts = Vec::new();
 
-        if let (Some(map_base), Some(map_a), Some(map_b)) = (val_base.as_object(), val_a.as_object(), val_b.as_object()) {
-            let mut merged = map_base.clone();
-            let mut has_conflict = false;
+        if a_val == b_val {
+            return (a_val.clone(), conflicts);
+        }
+        if a_val == base_val {
+            return (b_val.clone(), conflicts);
+        }
+        if b_val == base_val {
+            return (a_val.clone(), conflicts);
+        }
 
+        if let (Some(map_base), Some(map_a), Some(map_b)) = (base_val.as_object(), a_val.as_object(), b_val.as_object()) {
+            let mut merged = serde_json::Map::new();
             let all_keys: BTreeSet<String> = map_base.keys().chain(map_a.keys()).chain(map_b.keys()).cloned().collect();
 
             for k in all_keys {
+                let in_base = map_base.get(&k);
                 let in_a = map_a.get(&k);
                 let in_b = map_b.get(&k);
-                let in_base = map_base.get(&k);
 
                 match (in_a, in_b) {
                     (Some(va), None) => {
-                        if in_base == in_b {
-                            // deleted in b
-                            merged.remove(&k);
+                        if let Some(vbase) = in_base {
+                            if vbase == va {
+                                // Untouched in A, deleted in B
+                            } else {
+                                // Modified in A, deleted in B -> Conflict
+                                conflicts.push(MergeConflict {
+                                    path: format!("{}.{}", path, k),
+                                    conflict_type: "json_key".to_string(),
+                                    details: "Key modified in A but deleted in B".to_string(),
+                                });
+                                merged.insert(k, va.clone());
+                            }
                         } else {
+                            // Added only in A
                             merged.insert(k, va.clone());
                         }
                     }
                     (None, Some(vb)) => {
-                        if in_base == in_a {
-                            // deleted in a
-                            merged.remove(&k);
+                        if let Some(vbase) = in_base {
+                            if vbase == vb {
+                                // Untouched in B, deleted in A
+                            } else {
+                                // Modified in B, deleted in A -> Conflict
+                                conflicts.push(MergeConflict {
+                                    path: format!("{}.{}", path, k),
+                                    conflict_type: "json_key".to_string(),
+                                    details: "Key modified in B but deleted in A".to_string(),
+                                });
+                                merged.insert(k, vb.clone());
+                            }
                         } else {
+                            // Added only in B
                             merged.insert(k, vb.clone());
                         }
                     }
                     (Some(va), Some(vb)) => {
-                        if va == vb {
-                            merged.insert(k, va.clone());
-                        } else if Some(va) == in_base {
-                            merged.insert(k, vb.clone());
-                        } else if Some(vb) == in_base {
-                            merged.insert(k, va.clone());
-                        } else {
-                            // Conflict
-                            let mut conflict_obj = serde_json::Map::new();
-                            conflict_obj.insert("<<<<<<< AGENT_A".to_string(), va.clone());
-                            conflict_obj.insert("=======".to_string(), serde_json::Value::String("CONFLICT".to_string()));
-                            conflict_obj.insert(">>>>>>> AGENT_B".to_string(), vb.clone());
-                            merged.insert(k, serde_json::Value::Object(conflict_obj));
-                            has_conflict = true;
-                        }
+                        let empty_obj = serde_json::Value::Object(Default::default());
+                        let vbase = in_base.unwrap_or(&empty_obj);
+                        let (sub_val, sub_conflicts) = Self::merge_json_recursive(vbase, va, vb, &format!("{}.{}", path, k));
+                        conflicts.extend(sub_conflicts);
+                        merged.insert(k, sub_val);
                     }
-                    (None, None) => {
-                        merged.remove(&k);
-                    }
+                    (None, None) => {}
                 }
             }
-            return (serde_json::to_string_pretty(&merged).unwrap(), has_conflict);
+
+            return (serde_json::Value::Object(merged), conflicts);
         }
 
-        Self::merge_text_hunks(base, a, b)
+        // Conflict on scalar / non-matching types
+        conflicts.push(MergeConflict {
+            path: path.to_string(),
+            conflict_type: "json_key".to_string(),
+            details: format!("Conflicting value updates in JSON at {}", path),
+        });
+        (b_val.clone(), conflicts)
     }
 
-    fn merge_python_like(base: &str, a: &str, b: &str) -> (String, bool) {
-        let (imports_a, blocks_a) = Self::extract_py_components(a);
-        let (imports_b, blocks_b) = Self::extract_py_components(b);
-        let (imports_base, blocks_base) = Self::extract_py_components(base);
+    pub fn merge_text_3way(
+        base_text: &str,
+        a_text: &str,
+        b_text: &str,
+        path: &str,
+        label_a: &str,
+        label_b: &str,
+    ) -> (String, Vec<MergeConflict>) {
+        // Try git merge-file -p
+        let temp_dir = std::env::temp_dir();
+        let uid = uuid::Uuid::new_v4();
+        let path_a = temp_dir.join(format!("aggit_merge_a_{}.tmp", uid));
+        let path_base = temp_dir.join(format!("aggit_merge_base_{}.tmp", uid));
+        let path_b = temp_dir.join(format!("aggit_merge_b_{}.tmp", uid));
 
-        // Union of imports
-        let mut all_imports = BTreeSet::new();
-        all_imports.extend(imports_base);
-        all_imports.extend(imports_a);
-        all_imports.extend(imports_b);
+        let write_ok = (|| -> std::io::Result<()> {
+            let mut fa = File::create(&path_a)?;
+            fa.write_all(a_text.as_bytes())?;
+            let mut fbase = File::create(&path_base)?;
+            fbase.write_all(base_text.as_bytes())?;
+            let mut fb = File::create(&path_b)?;
+            fb.write_all(b_text.as_bytes())?;
+            Ok(())
+        })();
 
-        let mut all_block_keys: Vec<String> = Vec::new();
-        for k in blocks_base.keys().chain(blocks_a.keys()).chain(blocks_b.keys()) {
-            if !all_block_keys.contains(k) {
-                all_block_keys.push(k.clone());
+        if write_ok.is_ok() {
+            let output = Command::new("git")
+                .args([
+                    "merge-file",
+                    "-p",
+                    &format!("-L{}", label_a),
+                    "-LBASE",
+                    &format!("-L{}", label_b),
+                    path_a.to_str().unwrap(),
+                    path_base.to_str().unwrap(),
+                    path_b.to_str().unwrap(),
+                ])
+                .output();
+
+            let _ = std::fs::remove_file(&path_a);
+            let _ = std::fs::remove_file(&path_base);
+            let _ = std::fs::remove_file(&path_b);
+
+            if let Ok(out) = output {
+                let merged = String::from_utf8_lossy(&out.stdout).to_string();
+                let has_conflict = out.status.code().unwrap_or(0) != 0 || merged.contains(&format!("<<<<<<< {}", label_a));
+                let mut conflicts = Vec::new();
+                if has_conflict {
+                    conflicts.push(MergeConflict {
+                        path: path.to_string(),
+                        conflict_type: "text_overlap".to_string(),
+                        details: "Text conflict detected via git merge-file".to_string(),
+                    });
+                }
+                return (merged, conflicts);
             }
         }
 
-        let mut merged_blocks = Vec::new();
-        let mut has_conflict = false;
-
-        for k in all_block_keys {
-            let in_base = blocks_base.get(&k);
-            let in_a = blocks_a.get(&k);
-            let in_b = blocks_b.get(&k);
-
-            match (in_base, in_a, in_b) {
-                (None, Some(ca), None) => merged_blocks.push(ca.clone()),
-                (None, None, Some(cb)) => merged_blocks.push(cb.clone()),
-                (None, Some(ca), Some(cb)) => {
-                    if ca == cb {
-                        merged_blocks.push(ca.clone());
-                    } else {
-                        merged_blocks.push(format!("# <<<<<<< AGENT_A\n{}\n# =======\n{}\n# >>>>>>> AGENT_B", ca, cb));
-                        has_conflict = true;
-                    }
-                }
-                (Some(cbase), Some(ca), Some(cb)) => {
-                    if ca == cb {
-                        merged_blocks.push(ca.clone());
-                    } else if ca == cbase {
-                        merged_blocks.push(cb.clone());
-                    } else if cb == cbase {
-                        merged_blocks.push(ca.clone());
-                    } else {
-                        merged_blocks.push(format!("# <<<<<<< AGENT_A\n{}\n# =======\n{}\n# >>>>>>> AGENT_B", ca, cb));
-                        has_conflict = true;
-                    }
-                }
-                (Some(cbase), None, Some(cb)) => {
-                    if cb != cbase {
-                        merged_blocks.push(cb.clone());
-                    }
-                }
-                (Some(cbase), Some(ca), None) => {
-                    if ca != cbase {
-                        merged_blocks.push(ca.clone());
-                    }
-                }
-                (Some(_), None, None) => {}
-                _ => {}
-            }
-        }
-
-        let mut parts = Vec::new();
-        if !all_imports.is_empty() {
-            let imp_vec: Vec<String> = all_imports.into_iter().collect();
-            parts.push(imp_vec.join("\n"));
-        }
-        if !merged_blocks.is_empty() {
-            parts.push(merged_blocks.join("\n\n"));
-        }
-
-        (parts.join("\n\n") + "\n", has_conflict)
-    }
-
-    fn extract_py_components(src: &str) -> (BTreeSet<String>, HashMap<String, String>) {
-        let mut imports = BTreeSet::new();
-        let mut blocks = HashMap::new();
-
-        let mut cur_block_name = None;
-        let mut cur_block_lines: Vec<&str> = Vec::new();
-
-        for line in src.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with("import ") || trimmed.starts_with("from ") {
-                imports.insert(trimmed.to_string());
-                continue;
-            }
-
-            if trimmed.starts_with("def ") || trimmed.starts_with("async def ") || trimmed.starts_with("class ") {
-                if let Some(name) = cur_block_name.take() {
-                    blocks.insert(name, cur_block_lines.join("\n"));
-                    cur_block_lines.clear();
-                }
-
-                let sig_start = if trimmed.starts_with("async def ") { 10 } else if trimmed.starts_with("def ") { 4 } else { 6 };
-                let rest = &trimmed[sig_start..];
-                let name = rest.split('(').next().unwrap_or(rest).split(':').next().unwrap_or(rest).trim().to_string();
-                cur_block_name = Some(name);
-                cur_block_lines.push(line);
-            } else if cur_block_name.is_some() {
-                cur_block_lines.push(line);
-            }
-        }
-
-        if let Some(name) = cur_block_name {
-            blocks.insert(name, cur_block_lines.join("\n"));
-        }
-
-        (imports, blocks)
-    }
-
-    fn merge_text_hunks(_base: &str, a: &str, b: &str) -> (String, bool) {
-        if a == b {
-            (a.to_string(), false)
-        } else {
-            (format!("{}\n{}", a, b), false)
-        }
+        // Fallback: structured conflict markers if text differs
+        let conflict = MergeConflict {
+            path: path.to_string(),
+            conflict_type: "text_overlap".to_string(),
+            details: "Overlapping text modification".to_string(),
+        };
+        let merged = format!("<<<<<<< {}\n{}=======\n{}>>>>>>> {}\n", label_a, a_text, b_text, label_b);
+        (merged, vec![conflict])
     }
 }
