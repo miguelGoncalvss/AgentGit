@@ -1,0 +1,22 @@
+# Rust build artifacts
+target/
+aggit-rs/target/
+**/*.rs.bk
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# AgGit internal runtime repositories
+.aggit/
+benchmark_env/
+bench_rust_repo/
+test_run/
+*.tmp
+.tmp_*
