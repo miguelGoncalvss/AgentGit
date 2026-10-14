@@ -1,5 +1,11 @@
 use std::path::Path;
 
+const WINDOWS_RESERVED: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL",
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
 pub fn sanitize_repo_path<P: AsRef<Path>>(repo_dir: P, rel_path: &str) -> Result<String, String> {
     if rel_path.trim().is_empty() {
         return Err("Path cannot be empty or whitespace only".to_string());
@@ -25,10 +31,14 @@ pub fn sanitize_repo_path<P: AsRef<Path>>(repo_dir: P, rel_path: &str) -> Result
         return Err("Path resolves to empty".to_string());
     }
 
-    // Check traversal
+    // Check traversal and reserved device names
     for part in &parts {
         if *part == ".." {
             return Err(format!("Path traversal ('..') detected: '{}'", rel_path));
+        }
+        let base_stem = part.split('.').next().unwrap_or("").to_uppercase();
+        if WINDOWS_RESERVED.contains(&base_stem.as_str()) {
+            return Err(format!("Reserved Windows device name forbidden: '{}' in '{}'", part, rel_path));
         }
     }
 
@@ -45,21 +55,26 @@ pub fn sanitize_repo_path<P: AsRef<Path>>(repo_dir: P, rel_path: &str) -> Result
     };
 
     let target_path = repo_canonical.join(&joined);
-    // If target exists or parent exists, verify prefix
-    let check_path = if target_path.exists() {
-        target_path.canonicalize().unwrap_or(target_path)
-    } else if let Some(parent) = target_path.parent() {
-        if parent.exists() {
-            parent.canonicalize().unwrap_or(parent.to_path_buf()).join(target_path.file_name().unwrap())
-        } else {
-            target_path
-        }
+    // Walk existing parents to detect any symlink / junction escapes
+    let curr = if target_path.exists() || target_path.is_symlink() {
+        target_path.clone()
     } else {
-        target_path
+        let mut p = target_path.parent();
+        let mut existing_parent = repo_canonical.clone();
+        while let Some(parent) = p {
+            if parent.exists() || parent.is_symlink() {
+                existing_parent = parent.to_path_buf();
+                break;
+            }
+            p = parent.parent();
+        }
+        existing_parent
     };
 
-    if !check_path.starts_with(&repo_canonical) {
-        return Err(format!("Path resolves outside repository: '{}'", rel_path));
+    if let Ok(canon) = curr.canonicalize() {
+        if !canon.starts_with(&repo_canonical) {
+            return Err(format!("Path resolves outside repository via symlink: '{}'", rel_path));
+        }
     }
 
     Ok(joined)

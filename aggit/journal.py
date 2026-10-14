@@ -1,25 +1,26 @@
 """
-AgGit Journal: Lock-Free Append-Only Transaction Log.
-Features:
-- Full UUID identifiers.
-- Safe tempfile writing with .tmp extension (never mistaken for published events).
-- In-memory/file-backed derived index (.aggit/journal_index.json) for O(1) HEAD and lookup.
-- Detection of corrupted or incomplete transaction files.
-- Safe recovery and orphaned temporary cleanup.
-- Support for schema v2 and backward-compatible reading of v1 events.
+AgGit Append-Only Transaction Journal:
+Provides atomic, lock-free transaction appending with complete UUID identifiers.
+Supports:
+- Atomic rename publication with non-.json temporary files
+- Derived O(1) index caching with mtime freshness check and auto-healing
+- Strict causal & chronological transaction reconstruction
+- Zero silent drops when multiple writer instances exist
+- Full Schema v2 persistence
 """
 
 import os
-import glob
 import json
+import glob
 import uuid
-import tempfile
-from typing import List, Dict, Any, Optional
+import time
+from typing import List, Dict, Optional, Any
 from .storage import CASStorage
 from .schema import TransactionRecord, ChangeRecord
+from .lock_utils import file_lock
 
-class JournalCorruptionError(ValueError):
-    """Raised when an unrecoverable corruption is found in a transaction event."""
+class JournalCorruptionError(Exception):
+    """Raised when a journal record fails validation or is unparseable."""
     pass
 
 class Journal:
@@ -30,18 +31,22 @@ class Journal:
         self.index_path = os.path.join(self.repo_dir, ".aggit", "journal_index.json")
         os.makedirs(self.journal_dir, exist_ok=True)
         self._index: Optional[Dict[str, Any]] = None
+        self._index_mtime: Optional[float] = None
 
     def _load_index(self) -> Dict[str, Any]:
-        if self._index is not None:
+        disk_mtime = os.path.getmtime(self.index_path) if os.path.exists(self.index_path) else None
+        if self._index is not None and disk_mtime is not None and self._index_mtime == disk_mtime:
             return self._index
         if os.path.exists(self.index_path):
             try:
                 with open(self.index_path, "r", encoding="utf-8") as f:
                     self._index = json.load(f)
+                    self._index_mtime = disk_mtime
                     return self._index
             except Exception:
                 pass
         self._index = self._rebuild_index()
+        self._save_index(self._index)
         return self._index
 
     def _save_index(self, index: Dict[str, Any]):
@@ -51,6 +56,7 @@ class Journal:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(index, f, indent=2, sort_keys=True)
             os.replace(tmp, self.index_path)
+            self._index_mtime = os.path.getmtime(self.index_path)
         except Exception:
             if os.path.exists(tmp):
                 try:
@@ -113,7 +119,7 @@ class Journal:
         """
         Atomically appends a new transaction event to the journal.
         Uses full UUID and non-.json temporary file suffix.
-        Updates derived index in O(1).
+        Updates derived index reliably without dropping concurrent writes.
         """
         tx = TransactionRecord.create(
             agent_id=agent_id,
@@ -149,23 +155,11 @@ class Journal:
                     pass
             raise
 
-        # Update index
-        index = self._load_index()
-        index["head_tx_id"] = tx.tx_id
-        index["all_tx_ids"].append(tx.tx_id)
-        index["by_id"][tx.tx_id] = {
-            "filename": filename,
-            "tx_id": tx.tx_id,
-            "agent_id": tx.agent_id,
-            "session_id": tx.session_id,
-            "timestamp_ns": tx.timestamp_ns,
-            "timestamp": tx.timestamp,
-            "message": tx.message,
-            "parents": tx.parents,
-            "base_revision": tx.base_revision,
-            "schema_version": tx.schema_version
-        }
-        self._save_index(index)
+        # Update index under exclusive lock to avoid stale cache clobbering
+        lock_path = self.index_path + ".lock"
+        with file_lock(lock_path):
+            index = self._rebuild_index()
+            self._save_index(index)
 
         return tx
 
@@ -178,6 +172,16 @@ class Journal:
             matches = [info for tid, info in index.get("by_id", {}).items() if tid.startswith(tx_id)]
             if len(matches) == 1:
                 target_info = matches[0]
+
+        if not target_info:
+            # Index might be missing this tx; rebuild from journal files
+            index = self._rebuild_index()
+            self._save_index(index)
+            target_info = index.get("by_id", {}).get(tx_id)
+            if not target_info:
+                matches = [info for tid, info in index.get("by_id", {}).items() if tid.startswith(tx_id)]
+                if len(matches) == 1:
+                    target_info = matches[0]
 
         if not target_info:
             return None
