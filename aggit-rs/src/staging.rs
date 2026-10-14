@@ -185,10 +185,11 @@ impl StagingArea {
         agent_id: &str,
         rel_path: &str,
         content: Option<&[u8]>,
+        session_id: Option<&str>,
     ) -> std::io::Result<String> {
         let mut map = HashMap::new();
         map.insert(rel_path.to_string(), content.map(|c| c.to_vec()));
-        let res = self.stage_batch(storage, agent_id, None, Some(map), None, None)?;
+        let res = self.stage_batch(storage, agent_id, session_id, Some(map), None, None)?;
         let norm = sanitize_repo_path(&self.repo_dir, rel_path)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         let sha = res.get(&norm).and_then(|c| c.blob_sha.clone()).unwrap_or_default();

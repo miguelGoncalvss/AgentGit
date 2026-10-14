@@ -3,11 +3,41 @@ use std::process::Command;
 use std::fs::File;
 use std::io::Write;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+use serde::{Serialize, Deserialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeConflict {
     pub path: String,
     pub conflict_type: String,
     pub details: String,
+    #[serde(default)]
+    pub base_sha: Option<String>,
+    #[serde(default)]
+    pub a_sha: Option<String>,
+    #[serde(default)]
+    pub b_sha: Option<String>,
+    #[serde(default)]
+    pub label_a: Option<String>,
+    #[serde(default)]
+    pub label_b: Option<String>,
+    #[serde(default)]
+    pub conflict_id: Option<String>,
+}
+
+impl MergeConflict {
+    pub fn new(path: &str, conflict_type: &str, details: &str) -> Self {
+        Self {
+            path: path.to_string(),
+            conflict_type: conflict_type.to_string(),
+            details: details.to_string(),
+            base_sha: None,
+            a_sha: None,
+            b_sha: None,
+            label_a: None,
+            label_b: None,
+            conflict_id: Some(uuid::Uuid::new_v4().to_string()[..16].to_string()),
+        }
+    }
 }
 
 pub struct SemanticMerger;
@@ -54,20 +84,12 @@ impl SemanticMerger {
         // 5. Both changed differently
         // Modify / Delete conflicts
         if a_bytes.is_none() && b_bytes.is_some() {
-            conflicts.push(MergeConflict {
-                path: path.to_string(),
-                conflict_type: "modify_delete".to_string(),
-                details: "File deleted by A but modified by B".to_string(),
-            });
+            conflicts.push(MergeConflict::new(path, "modify_delete", "File deleted by A but modified by B"));
             return (b_bytes.map(|b| b.to_vec()), conflicts);
         }
 
         if b_bytes.is_none() && a_bytes.is_some() {
-            conflicts.push(MergeConflict {
-                path: path.to_string(),
-                conflict_type: "modify_delete".to_string(),
-                details: "File deleted by B but modified by A".to_string(),
-            });
+            conflicts.push(MergeConflict::new(path, "modify_delete", "File deleted by B but modified by A"));
             return (a_bytes.map(|b| b.to_vec()), conflicts);
         }
 
@@ -76,11 +98,7 @@ impl SemanticMerger {
 
         // Binary file check
         if is_binary(a) || is_binary(b) || base_bytes.map_or(false, is_binary) {
-            conflicts.push(MergeConflict {
-                path: path.to_string(),
-                conflict_type: "binary".to_string(),
-                details: "Binary file modified concurrently with different contents".to_string(),
-            });
+            conflicts.push(MergeConflict::new(path, "binary", "Binary file modified concurrently with different contents"));
             return (Some(b.to_vec()), conflicts);
         }
 
@@ -148,11 +166,11 @@ impl SemanticMerger {
                                 // Untouched in A, deleted in B
                             } else {
                                 // Modified in A, deleted in B -> Conflict
-                                conflicts.push(MergeConflict {
-                                    path: format!("{}.{}", path, k),
-                                    conflict_type: "json_key".to_string(),
-                                    details: "Key modified in A but deleted in B".to_string(),
-                                });
+                                conflicts.push(MergeConflict::new(
+                                    &format!("{}.{}", path, k),
+                                    "json_key",
+                                    "Key modified in A but deleted in B",
+                                ));
                                 merged.insert(k, va.clone());
                             }
                         } else {
@@ -166,11 +184,11 @@ impl SemanticMerger {
                                 // Untouched in B, deleted in A
                             } else {
                                 // Modified in B, deleted in A -> Conflict
-                                conflicts.push(MergeConflict {
-                                    path: format!("{}.{}", path, k),
-                                    conflict_type: "json_key".to_string(),
-                                    details: "Key modified in B but deleted in A".to_string(),
-                                });
+                                conflicts.push(MergeConflict::new(
+                                    &format!("{}.{}", path, k),
+                                    "json_key",
+                                    "Key modified in B but deleted in A",
+                                ));
                                 merged.insert(k, vb.clone());
                             }
                         } else {
@@ -193,11 +211,11 @@ impl SemanticMerger {
         }
 
         // Conflict on scalar / non-matching types
-        conflicts.push(MergeConflict {
-            path: path.to_string(),
-            conflict_type: "json_key".to_string(),
-            details: format!("Conflicting value updates in JSON at {}", path),
-        });
+        conflicts.push(MergeConflict::new(
+            path,
+            "json_key",
+            &format!("Conflicting value updates in JSON at {}", path),
+        ));
         (b_val.clone(), conflicts)
     }
 
@@ -249,22 +267,22 @@ impl SemanticMerger {
                 let has_conflict = out.status.code().unwrap_or(0) != 0 || merged.contains(&format!("<<<<<<< {}", label_a));
                 let mut conflicts = Vec::new();
                 if has_conflict {
-                    conflicts.push(MergeConflict {
-                        path: path.to_string(),
-                        conflict_type: "text_overlap".to_string(),
-                        details: "Text conflict detected via git merge-file".to_string(),
-                    });
+                    conflicts.push(MergeConflict::new(
+                        path,
+                        "text_overlap",
+                        "Text conflict detected via git merge-file",
+                    ));
                 }
                 return (merged, conflicts);
             }
         }
 
         // Fallback: structured conflict markers if text differs
-        let conflict = MergeConflict {
-            path: path.to_string(),
-            conflict_type: "text_overlap".to_string(),
-            details: "Overlapping text modification".to_string(),
-        };
+        let conflict = MergeConflict::new(
+            path,
+            "text_overlap",
+            "Overlapping text modification",
+        );
         let merged = format!("<<<<<<< {}\n{}=======\n{}>>>>>>> {}\n", label_a, a_text, b_text, label_b);
         (merged, vec![conflict])
     }

@@ -16,6 +16,13 @@ O **AgGit** atua como um sistema de controle de versão concorrente para agentes
    - Um ledger interno (`.aggit/git_export_map.json`) mapeia revisões AgGit para hashes de commit Git. Exportar a mesma revisão repetidamente não gera commits duplicados.
 5. **Autenticação Segura via GitHub CLI**:
    - O AgGit não armazena, transmite ou solicita tokens de acesso. Toda interação com o GitHub delega para o utilitário oficial `gh` e reutiliza a sessão autenticada do usuário.
+6. **Continuidade de Branch sem Reset**:
+   - Quando múltiplos exports sucessivos são enviados para a mesma branch, o AgGit reutiliza o commit existente como ancestral direto (`commit 1 -> commit 2`), evitando resets forçados (`-B`) que destruiriam a linhagem da branch.
+7. **Preservação de Arquivos Git Pré-existentes**:
+   - A exportação respeita arquivos Git existentes na branch que não sejam gerenciados pelo AgGit (por exemplo: `.github/workflows/`, `keep.md`, `README.md`). Apenas arquivos que possuem uma ação explícita de exclusão (`action: "delete"`) no AgGit são removidos da branch Git.
+8. **Plumbing Seguro em Repositórios Vazios**:
+   - Se o repositório Git local acabou de ser criado e não possui nenhum commit raiz, o AgGit cria o commit inicial utilizando encadeamento de baixo nível (`git commit-tree 4b825dc...` com a hash SHA-1 de árvore vazia padrão do Git) e `git update-ref`, garantindo que arquivos modificados e não comitados no diretório do usuário não sejam capturados no commit raiz.
+
 
 ---
 

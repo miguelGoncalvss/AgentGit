@@ -3,44 +3,46 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
+
 use crate::storage::CASStorage;
-use crate::journal::Journal;
 use crate::staging::StagingArea;
+use crate::journal::Journal;
+use crate::schema::{ChangeRecord, ChangeAction, Transaction};
 use crate::semantic::{SemanticMerger, MergeConflict};
-use crate::schema::{ChangeAction, ChangeRecord, Transaction};
 use crate::path_utils::sanitize_repo_path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Checkpoint {
     pub version: u32,
-    pub tree: HashMap<String, String>, // path -> blob_sha
+    pub tree: HashMap<String, String>,
     pub processed_tx_ids: Vec<String>,
+    #[serde(default)]
+    pub pending_conflicts: Vec<MergeConflict>,
 }
 
 pub struct AgGitEngine {
     pub repo_dir: PathBuf,
-    pub aggit_dir: PathBuf,
     pub storage: CASStorage,
     pub journal: Journal,
     pub staging: StagingArea,
-    pub checkpoint_dir: PathBuf,
-    pub materialized_state_path: PathBuf,
+    checkpoint_dir: PathBuf,
+    materialized_state_path: PathBuf,
 }
 
 impl AgGitEngine {
     pub fn new<P: AsRef<Path>>(repo_dir: P) -> Self {
-        let repo_path = repo_dir.as_ref().to_path_buf();
-        let aggit_dir = repo_path.join(".aggit");
-        let storage = CASStorage::new(&repo_path);
-        let journal = Journal::new(&repo_path);
-        let staging = StagingArea::new(&repo_path);
+        let repo_dir = repo_dir.as_ref().to_path_buf();
+        let storage = CASStorage::new(&repo_dir);
+        let journal = Journal::new(&repo_dir);
+        let staging = StagingArea::new(&repo_dir);
+        let aggit_dir = repo_dir.join(".aggit");
         let checkpoint_dir = aggit_dir.join("checkpoints");
         let materialized_state_path = aggit_dir.join("materialized_state.json");
+
         let _ = fs::create_dir_all(&checkpoint_dir);
 
         Self {
-            repo_dir: repo_path,
-            aggit_dir,
+            repo_dir,
             storage,
             journal,
             staging,
@@ -50,16 +52,17 @@ impl AgGitEngine {
     }
 
     pub fn init<P: AsRef<Path>>(repo_dir: P) -> std::io::Result<Self> {
-        let aggit_dir = repo_dir.as_ref().join(".aggit");
+        let repo_dir = repo_dir.as_ref().to_path_buf();
+        let aggit_dir = repo_dir.join(".aggit");
         fs::create_dir_all(&aggit_dir)?;
         let config_path = aggit_dir.join("config.json");
         if !config_path.exists() {
-            let mut f = File::create(&config_path)?;
-            f.write_all(b"{\n  \"version\": \"2.0.0\",\n  \"engine\": \"aggit-rust-native\"\n}\n")?;
+            fs::write(config_path, b"{\"version\": \"2.0.0\", \"engine\": \"aggit-rs\"}\n")?;
         }
         Ok(Self::new(repo_dir))
     }
 
+    /// Commit transaction lock-free.
     pub fn commit(
         &self,
         agent_id: &str,
@@ -71,8 +74,8 @@ impl AgGitEngine {
     ) -> std::io::Result<Transaction> {
         let staged_doc = self.staging.get_staged_doc(agent_id, session_id);
         let current_generation = staged_doc.generation;
-
         let effective_base = base_revision.or(staged_doc.base_revision);
+
         let effective_parents = match parents {
             Some(p) => p,
             None => {
@@ -129,9 +132,10 @@ impl AgGitEngine {
             }
         }
         Checkpoint {
-            version: 1,
+            version: 2,
             tree: HashMap::new(),
             processed_tx_ids: Vec::new(),
+            pending_conflicts: Vec::new(),
         }
     }
 
@@ -193,16 +197,21 @@ impl AgGitEngine {
         Ok(tree)
     }
 
-    /// Incremental reconciliation using checkpoints and accurate 3-way ancestor resolution
-    pub fn reconcile_state(&self) -> Result<(HashMap<String, Vec<u8>>, Vec<MergeConflict>), String> {
+    /// Incremental reconciliation using checkpoints and accurate 3-way ancestor resolution.
+    /// Preserves pending conflicts across calls and restarts.
+    pub fn reconcile_state(&self, dry_run: bool) -> Result<(HashMap<String, Vec<u8>>, Vec<MergeConflict>), String> {
         let mut checkpoint = self.load_checkpoint();
         let mut tree = checkpoint.tree.clone();
         let mut processed_set: HashSet<String> = checkpoint.processed_tx_ids.iter().cloned().collect();
         let all_txs = self.journal.get_all_transactions()?;
 
-        let mut conflicts = Vec::new();
+        // Track pending conflicts by path
+        let mut conflicts_by_path: HashMap<String, MergeConflict> = HashMap::new();
+        for c in checkpoint.pending_conflicts {
+            conflicts_by_path.insert(c.path.clone(), c);
+        }
 
-        for tx in all_txs {
+        for tx in &all_txs {
             if processed_set.contains(&tx.tx_id) {
                 continue;
             }
@@ -216,8 +225,27 @@ impl AgGitEngine {
             };
 
             for (path, change) in tx.get_effective_changes() {
-                let base_sha = base_tree.get(&path);
-                let curr_sha = tree.get(&path);
+                let norm = sanitize_repo_path(&self.repo_dir, &path)
+                    .unwrap_or_else(|_| path.clone());
+
+                if conflicts_by_path.contains_key(&norm) {
+                    // This transaction provides explicit resolution for this conflicted path
+                    conflicts_by_path.remove(&norm);
+                    match change.action {
+                        ChangeAction::Delete => {
+                            tree.remove(&norm);
+                        }
+                        _ => {
+                            if let Some(sha) = change.blob_sha {
+                                tree.insert(norm, sha);
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                let base_sha = base_tree.get(&norm);
+                let curr_sha = tree.get(&norm);
                 let tx_sha = change.blob_sha.as_ref();
 
                 let base_bytes = base_sha.and_then(|s| self.storage.get_blob(s).ok());
@@ -225,7 +253,7 @@ impl AgGitEngine {
                 let tx_bytes = tx_sha.and_then(|s| self.storage.get_blob(s).ok());
 
                 let (merged_bytes_opt, step_conflicts) = SemanticMerger::merge_files(
-                    &path,
+                    &norm,
                     base_bytes.as_deref(),
                     curr_bytes.as_deref(),
                     tx_bytes.as_deref(),
@@ -233,26 +261,37 @@ impl AgGitEngine {
                     &tx.agent_id,
                 );
 
-                conflicts.extend(step_conflicts);
+                if !step_conflicts.is_empty() {
+                    for sc in step_conflicts {
+                        conflicts_by_path.insert(sc.path.clone(), sc);
+                    }
+                } else {
+                    conflicts_by_path.remove(&norm);
+                }
 
                 match merged_bytes_opt {
                     Some(merged_bytes) => {
                         if let Ok(new_sha) = self.storage.store_blob(&merged_bytes) {
-                            tree.insert(path, new_sha);
+                            tree.insert(norm, new_sha);
                         }
                     }
                     None => {
-                        tree.remove(&path);
+                        tree.remove(&norm);
                     }
                 }
             }
 
             processed_set.insert(tx.tx_id.clone());
-            checkpoint.processed_tx_ids.push(tx.tx_id);
+            checkpoint.processed_tx_ids.push(tx.tx_id.clone());
         }
 
-        checkpoint.tree = tree.clone();
-        let _ = self.save_checkpoint(&checkpoint);
+        let all_conflicts: Vec<MergeConflict> = conflicts_by_path.values().cloned().collect();
+
+        if !dry_run {
+            checkpoint.tree = tree.clone();
+            checkpoint.pending_conflicts = all_conflicts.clone();
+            let _ = self.save_checkpoint(&checkpoint);
+        }
 
         let mut unified_files = HashMap::new();
         for (p, sha) in tree {
@@ -261,13 +300,60 @@ impl AgGitEngine {
             }
         }
 
-        Ok((unified_files, conflicts))
+        Ok((unified_files, all_conflicts))
     }
 
-    /// Smart materialization: writes only modified files, applies deletions, returns verified count
-    pub fn materialize(&self) -> std::io::Result<(usize, Vec<MergeConflict>)> {
-        let (unified_files, conflicts) = self.reconcile_state()
+    /// Explicitly resolves a pending conflict on path.
+    pub fn resolve_conflict(
+        &self,
+        path: &str,
+        resolved_bytes: Option<Vec<u8>>,
+        agent_id: &str,
+        message: &str,
+    ) -> std::io::Result<Transaction> {
+        let norm = sanitize_repo_path(&self.repo_dir, path)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+        let mut changes = HashMap::new();
+        match resolved_bytes {
+            Some(bytes) => {
+                let sha = self.storage.store_blob(&bytes)?;
+                changes.insert(norm, ChangeRecord::modify(sha, None));
+            }
+            None => {
+                changes.insert(norm, ChangeRecord::delete(None));
+            }
+        }
+
+        let latest = self.journal.get_latest_transaction();
+        let parents = latest.map(|t| vec![t.tx_id]).unwrap_or_default();
+
+        let tx = self.journal.append_transaction(
+            &self.storage,
+            agent_id,
+            None,
+            message,
+            changes,
+            parents,
+            None,
+        )?;
+
+        let _ = self.reconcile_state(false);
+        Ok(tx)
+    }
+
+    /// Smart materialization: writes only modified files, pre-validates to preserve local edits,
+    /// blocks if conflicts exist unless force is specified.
+    pub fn materialize(&self, force: bool) -> std::io::Result<(usize, Vec<MergeConflict>)> {
+        let (unified_files, conflicts) = self.reconcile_state(false)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+        if !conflicts.is_empty() && !force {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Materialization blocked: {} unresolved conflict(s) pending", conflicts.len()),
+            ));
+        }
 
         let mut prev_state: HashMap<String, String> = HashMap::new();
         if self.materialized_state_path.exists() {
@@ -278,6 +364,71 @@ impl AgGitEngine {
             }
         }
 
+        // -------------------------------------------------------------
+        // PHASE 1: Pre-validation of all files
+        // -------------------------------------------------------------
+        let mut all_paths = HashSet::new();
+        for k in unified_files.keys() {
+            all_paths.insert(k.clone());
+        }
+        for k in prev_state.keys() {
+            all_paths.insert(k.clone());
+        }
+
+        for p in &all_paths {
+            let full_path = self.repo_dir.join(p);
+            let disk_bytes = fs::read(&full_path).ok();
+            let disk_sha = disk_bytes.as_ref().map(|b| {
+                use sha2::{Sha256, Digest};
+                let mut h = Sha256::new();
+                h.update(b);
+                format!("{:x}", h.finalize())
+            });
+
+            let prev_sha = prev_state.get(p);
+            let desired = unified_files.get(p);
+            let desired_sha = desired.map(|b| {
+                use sha2::{Sha256, Digest};
+                let mut h = Sha256::new();
+                h.update(b);
+                format!("{:x}", h.finalize())
+            });
+
+            if disk_sha == desired_sha {
+                continue;
+            }
+
+            // Scheduled for delete
+            if desired_sha.is_none() {
+                if disk_sha.is_some() && prev_sha.is_some() && disk_sha.as_ref() != prev_sha && !force {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Local modification would be deleted: '{}'", p),
+                    ));
+                }
+            }
+
+            // Scheduled for write
+            if desired_sha.is_some() {
+                if disk_sha.is_some() {
+                    if prev_sha.is_none() && !force {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("Untracked file would be overwritten: '{}'", p),
+                        ));
+                    } else if prev_sha.is_some() && disk_sha.as_ref() != prev_sha && !force {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("Local modification would be overwritten: '{}'", p),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // -------------------------------------------------------------
+        // PHASE 2: Safe atomic execution
+        // -------------------------------------------------------------
         // 1. Remove deleted files
         for old_path in prev_state.keys() {
             if !unified_files.contains_key(old_path) {
@@ -305,7 +456,7 @@ impl AgGitEngine {
                 fs::create_dir_all(parent)?;
             }
 
-            let tmp_path = full_path.with_extension(format!("tmp_{}", uuid::Uuid::new_v4()));
+            let tmp_path = full_path.with_extension(format!("tmp_{}_{:?}_{}.tmp", std::process::id(), std::thread::current().id(), uuid::Uuid::new_v4()));
             {
                 let mut f = File::create(&tmp_path)?;
                 f.write_all(content)?;

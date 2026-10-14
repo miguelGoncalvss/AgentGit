@@ -3,10 +3,13 @@ use std::path::PathBuf;
 use std::time::Instant;
 use clap::{Parser, Subcommand};
 use rayon::prelude::*;
+
 use aggit::engine::AgGitEngine;
 
 #[derive(Parser)]
-#[command(name = "aggit", version = "0.2.0", about = "AgGit: Rust-Native Lock-Free Version Control System for AI Agents")]
+#[command(name = "aggit")]
+#[command(about = "AgGit: Lock-Free Multi-Agent Native VCS (Rust Native Engine)", long_about = None)]
+#[command(version = "0.2.0")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -14,13 +17,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize an AgGit repository
+    /// Initialize an empty AgGit repository
     Init {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
     /// Stage a file for an agent
     Stage {
+        #[arg(short, long)]
         file: String,
         #[arg(short, long)]
         agent: String,
@@ -29,8 +33,9 @@ enum Commands {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
-    /// Stage deletion of a file
+    /// Stage deletion of a file for an agent
     StageDelete {
+        #[arg(short, long)]
         file: String,
         #[arg(short, long)]
         agent: String,
@@ -64,13 +69,19 @@ enum Commands {
     },
     /// Reconcile and smart-materialize state to disk
     Reconcile {
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        force: bool,
         #[arg(default_value = ".")]
         path: PathBuf,
     },
     /// Run native concurrency benchmark
     Benchmark {
-        #[arg(short, long, default_value_t = 50)]
+        #[arg(short, long, default_value_t = 20)]
         agents: usize,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -84,7 +95,7 @@ fn main() -> std::io::Result<()> {
         }
         Commands::Stage { file, agent, session, path } => {
             let engine = AgGitEngine::new(&path);
-            let sha = engine.staging.stage_file(&engine.storage, &agent, &file, None)?;
+            let sha = engine.staging.stage_file(&engine.storage, &agent, &file, None, session.as_deref())?;
             println!("[AgGit-RS] Agent '{}' (session: {:?}) staged '{}' (blob: {})", agent, session, file, &sha[..8]);
         }
         Commands::StageDelete { file, agent, session, path } => {
@@ -121,32 +132,36 @@ fn main() -> std::io::Result<()> {
                 println!();
             }
         }
-        Commands::Reconcile { path } => {
+        Commands::Reconcile { dry_run, force, path } => {
             let engine = AgGitEngine::new(&path);
-            let (count, conflicts) = engine.materialize()?;
-            println!("[AgGit-RS] Reconciled and materialized {} files into working directory.", count);
-            if !conflicts.is_empty() {
-                println!("WARNING: Conflicts found in {} files:", conflicts.len());
+            if dry_run {
+                let (files, conflicts) = engine.reconcile_state(true)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                println!("[AgGit-RS Dry-run] Reconciled in-memory: {} files, {} conflicts.", files.len(), conflicts.len());
                 for c in &conflicts {
-                    println!("  ! {} ({}: {})", c.path, c.conflict_type, c.details);
+                    println!("  ! Conflict in '{}' ({}: {})", c.path, c.conflict_type, c.details);
                 }
             } else {
-                println!("Status: 100% clean merge.");
+                let (count, conflicts) = engine.materialize(force)?;
+                println!("[AgGit-RS] Reconciled and materialized {} files into working directory.", count);
+                if !conflicts.is_empty() {
+                    println!("WARNING: Conflicts found in {} files:", conflicts.len());
+                    for c in &conflicts {
+                        println!("  ! {} ({}: {})", c.path, c.conflict_type, c.details);
+                    }
+                } else {
+                    println!("Status: Clean merge.");
+                }
             }
         }
-        Commands::Benchmark { agents } => {
-            println!("============================================================");
-            println!("RUST HARDWARE-ACCELERATED BENCHMARK: {} CONCURRENT AGENTS", agents);
-            println!("============================================================");
-
-            let bench_dir = PathBuf::from("bench_rust_repo");
-            let _ = std::fs::remove_dir_all(&bench_dir);
+        Commands::Benchmark { agents, json } => {
+            let bench_dir = std::env::temp_dir().join(format!("aggit_bench_rust_{}_{}", std::process::id(), uuid::Uuid::new_v4()));
             let engine = AgGitEngine::init(&bench_dir)?;
 
             let start = Instant::now();
 
-            // Run concurrent agent commits using Rayon CPU thread pool
-            let success_count: usize = (0..agents)
+            // Run concurrent agent commits using Rayon CPU thread pool and record individual latencies
+            let worker_results: Vec<(bool, f64)> = (0..agents)
                 .into_par_iter()
                 .map(|i| {
                     let agent_id = format!("agent_{:03}", i);
@@ -154,28 +169,101 @@ fn main() -> std::io::Result<()> {
                     let content = format!("// Generated by agent {}\nfn worker_{}() {{ println!(\"ok\"); }}\n", i, i);
                     files.insert(format!("src/worker_{}.rs", i), content.into_bytes());
 
-                    match engine.commit(&agent_id, None, &format!("Agent {} commit", i), Some(files), None, None) {
-                        Ok(_) => 1,
-                        Err(_) => 0,
-                    }
+                    let t0 = Instant::now();
+                    let res = engine.commit(&agent_id, None, &format!("Agent {} commit", i), Some(files), None, None);
+                    let elapsed_sec = t0.elapsed().as_secs_f64();
+                    (res.is_ok(), elapsed_sec)
                 })
-                .sum();
+                .collect();
 
-            let elapsed = start.elapsed();
-            println!("[Benchmark] {} commits attempted, {} succeeded (0 locks, 0 failures!)", agents, success_count);
-            println!("[Benchmark] Total Time: {:?}", elapsed);
-            let ops_per_sec = (success_count as f64) / elapsed.as_secs_f64();
-            println!("[Benchmark] Throughput: {:.2} commits / second directly to hardware CAS!", ops_per_sec);
+            let commit_elapsed = start.elapsed().as_secs_f64();
+            let mut successes = 0;
+            let mut failures = 0;
+            let mut latencies: Vec<f64> = Vec::with_capacity(agents);
+
+            for (ok, dur) in worker_results {
+                if ok {
+                    successes += 1;
+                } else {
+                    failures += 1;
+                }
+                latencies.push(dur);
+            }
+
+            latencies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+            let median_latency = if latencies.is_empty() {
+                0.0
+            } else {
+                latencies[latencies.len() / 2]
+            };
+
+            let p95_latency = if latencies.is_empty() {
+                0.0
+            } else {
+                let idx = ((latencies.len() as f64) * 0.95).floor() as usize;
+                latencies[idx.min(latencies.len() - 1)]
+            };
 
             // Reconcile and parallel materialize
             let mat_start = Instant::now();
-            let (mat_count, _) = engine.materialize()?;
-            let mat_elapsed = mat_start.elapsed();
-            println!("[Benchmark] Parallel Materialized {} files in {:?}", mat_count, mat_elapsed);
+            let (mat_count, conflicts) = engine.materialize(false)?;
+            let mat_elapsed = mat_start.elapsed().as_secs_f64();
+            let total_time_sec = commit_elapsed + mat_elapsed;
 
-            // Cleanup
+            // Verify content on disk
+            let mut content_verified = conflicts.is_empty() && mat_count == agents;
+            for i in 0..agents {
+                let file_path = bench_dir.join(format!("src/worker_{}.rs", i));
+                if !file_path.exists() {
+                    content_verified = false;
+                    break;
+                }
+            }
+
+            let ops_per_sec = if total_time_sec > 0.0 {
+                (successes as f64) / total_time_sec
+            } else {
+                0.0
+            };
+
+            let error_rate = if agents > 0 {
+                (failures as f64 / agents as f64) * 100.0
+            } else {
+                0.0
+            };
+
+            // Cleanup temp bench repo
             let _ = std::fs::remove_dir_all(&bench_dir);
-            println!("============================================================");
+
+            if json {
+                let out = serde_json::json!({
+                    "system": "AgGit (Rust Native Engine)",
+                    "agents": agents,
+                    "concurrency": rayon::current_num_threads(),
+                    "total_time_sec": total_time_sec,
+                    "commit_time_sec": commit_elapsed,
+                    "reconcile_time_sec": mat_elapsed,
+                    "successes": successes,
+                    "failures": failures,
+                    "error_rate_pct": error_rate,
+                    "throughput_ops_sec": ops_per_sec,
+                    "median_latency_sec": median_latency,
+                    "p95_latency_sec": p95_latency,
+                    "content_verified": content_verified
+                });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                println!("============================================================");
+                println!("RUST HARDWARE-ACCELERATED BENCHMARK: {} CONCURRENT AGENTS", agents);
+                println!("============================================================");
+                println!("[Benchmark] {} commits attempted, {} succeeded, {} failed", agents, successes, failures);
+                println!("[Benchmark] Commit Time: {:.3}s, Reconcile/Materialize Time: {:.3}s, Total Time: {:.3}s", commit_elapsed, mat_elapsed, total_time_sec);
+                println!("[Benchmark] Throughput: {:.2} ops/sec", ops_per_sec);
+                println!("[Benchmark] Latency: median={:.4}s, p95={:.4}s", median_latency, p95_latency);
+                println!("[Benchmark] Content Verified: {}", content_verified);
+                println!("============================================================");
+            }
         }
     }
 

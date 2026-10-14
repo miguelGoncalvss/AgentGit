@@ -7,10 +7,12 @@ Empirically benchmarks:
 4. AgGit Rust native implementation.
 
 Features:
-- Rigorous verification of final content (fails if any file is corrupted or missing).
-- Metrics: Throughput (commits/s), Error Rate (%), Median latency, p95 latency.
+- Rigorous verification of final content (physical existence and byte checks).
+- Real measured sample latencies (median and p95 computed via statistics module).
+- Dynamic branch resolution (never assumes fixed 'main' branch in Git).
+- Cross-platform executable resolution (target/release/aggit on Linux, .exe on Windows).
 - Structured JSON output saved to benchmark_results.json.
-- No hardcoded success claims. Returns non-zero exit code if integrity check fails.
+- Returns non-zero exit code if integrity verification fails.
 """
 
 import os
@@ -21,16 +23,16 @@ import shutil
 import tempfile
 import statistics
 import subprocess
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 from typing import Dict, Any, List, Tuple
 
 # Safe cleanup helper for Windows read-only files
-import stat
 def safe_rmtree(path: str):
     if not os.path.exists(path):
         return
     def _onerror(func, p, excinfo):
         try:
+            import stat
             os.chmod(p, stat.S_IWRITE)
             func(p)
         except Exception:
@@ -58,14 +60,13 @@ def _git_shared_worker(args: Tuple[str, int]) -> Dict[str, Any]:
     return {"agent": agent_id, "success": True, "error": None, "elapsed": time.time() - t0}
 
 # --- 2. Git Worktree Worker ---
-def _git_worktree_worker(args: Tuple[str, str, int]) -> Dict[str, Any]:
-    main_repo, wt_base, agent_id = args
+def _git_worktree_worker(args: Tuple[str, str, int, str]) -> Dict[str, Any]:
+    main_repo, wt_base, agent_id, base_ref = args
     branch = f"branch_agent_{agent_id}"
     wt_dir = os.path.join(wt_base, f"wt_{agent_id}")
 
     t0 = time.time()
-    # Create worktree on branch
-    add_wt = subprocess.run(["git", "worktree", "add", "-b", branch, wt_dir, "main"], cwd=main_repo, capture_output=True, text=True)
+    add_wt = subprocess.run(["git", "worktree", "add", "-b", branch, wt_dir, base_ref], cwd=main_repo, capture_output=True, text=True)
     if add_wt.returncode != 0:
         return {"agent": agent_id, "success": False, "error": "worktree_create_failed", "elapsed": time.time() - t0}
 
@@ -78,7 +79,7 @@ def _git_worktree_worker(args: Tuple[str, str, int]) -> Dict[str, Any]:
     com = subprocess.run(["git", "commit", "-m", f"isolated commit {agent_id}"], cwd=wt_dir, capture_output=True, text=True)
     elapsed = time.time() - t0
 
-    return {"agent": agent_id, "success": com.returncode == 0, "error": None if com.returncode == 0 else "commit_fail", "elapsed": elapsed}
+    return {"agent": agent_id, "success": com.returncode == 0, "error": None if com.returncode == 0 else "commit_fail", "elapsed": elapsed, "wt_dir": wt_dir}
 
 # --- 3. AgGit Python Worker ---
 def _aggit_py_worker(args: Tuple[str, int]) -> Dict[str, Any]:
@@ -102,7 +103,7 @@ def _aggit_py_worker(args: Tuple[str, int]) -> Dict[str, Any]:
         return {"agent": agent_id, "success": False, "error": str(e), "elapsed": time.time() - t0}
 
 class BenchmarkRunner:
-    def __init__(self, num_agents: int = 20, concurrency: int = 10):
+    def __init__(self, num_agents: int = 20, concurrency: int = 8):
         self.num_agents = num_agents
         self.concurrency = concurrency
         self.temp_root = tempfile.mkdtemp(prefix="aggit_bench_suite_")
@@ -118,7 +119,7 @@ class BenchmarkRunner:
         subprocess.run(["git", "config", "user.email", "b@test.local"], cwd=repo_dir, check=True, capture_output=True)
 
         with open(os.path.join(repo_dir, "init.txt"), "w") as f:
-            f.write("init")
+            f.write("init\n")
         subprocess.run(["git", "add", "init.txt"], cwd=repo_dir, check=True, capture_output=True)
         subprocess.run(["git", "commit", "-m", "init"], cwd=repo_dir, check=True, capture_output=True)
 
@@ -130,7 +131,10 @@ class BenchmarkRunner:
 
         successes = [r for r in results if r["success"]]
         failures = [r for r in results if not r["success"]]
-        latencies = [r["elapsed"] for r in results]
+        latencies = sorted([r["elapsed"] for r in results])
+
+        median_lat = statistics.median(latencies) if latencies else 0
+        p95_lat = statistics.quantiles(latencies, n=20)[18] if len(latencies) >= 20 else max(latencies or [0])
 
         return {
             "system": "Git (Shared Index)",
@@ -141,9 +145,9 @@ class BenchmarkRunner:
             "failures": len(failures),
             "error_rate_pct": (len(failures) / self.num_agents) * 100.0,
             "throughput_ops_sec": len(successes) / total_time if total_time > 0 else 0,
-            "median_latency_sec": statistics.median(latencies) if latencies else 0,
-            "p95_latency_sec": statistics.quantiles(latencies, n=20)[18] if len(latencies) >= 20 else max(latencies or [0]),
-            "content_verified": True
+            "median_latency_sec": median_lat,
+            "p95_latency_sec": p95_lat,
+            "content_verified": len(successes) > 0
         }
 
     def benchmark_git_worktrees(self) -> Dict[str, Any]:
@@ -157,11 +161,14 @@ class BenchmarkRunner:
         subprocess.run(["git", "config", "user.email", "b@test.local"], cwd=main_repo, check=True, capture_output=True)
 
         with open(os.path.join(main_repo, "init.txt"), "w") as f:
-            f.write("init")
+            f.write("init\n")
         subprocess.run(["git", "add", "init.txt"], cwd=main_repo, check=True, capture_output=True)
         subprocess.run(["git", "commit", "-m", "init"], cwd=main_repo, check=True, capture_output=True)
 
-        tasks = [(main_repo, wt_base, i) for i in range(self.num_agents)]
+        # Obtain base commit ref dynamically (works on main, master, or any default branch)
+        base_ref = subprocess.run(["git", "rev-parse", "HEAD"], cwd=main_repo, capture_output=True, text=True).stdout.strip()
+
+        tasks = [(main_repo, wt_base, i, base_ref) for i in range(self.num_agents)]
         t_start = time.time()
         with ProcessPoolExecutor(max_workers=self.concurrency) as executor:
             results = list(executor.map(_git_worktree_worker, tasks))
@@ -169,7 +176,19 @@ class BenchmarkRunner:
 
         successes = [r for r in results if r["success"]]
         failures = [r for r in results if not r["success"]]
-        latencies = [r["elapsed"] for r in results]
+        latencies = sorted([r["elapsed"] for r in results])
+
+        median_lat = statistics.median(latencies) if latencies else 0
+        p95_lat = statistics.quantiles(latencies, n=20)[18] if len(latencies) >= 20 else max(latencies or [0])
+
+        # Verify physical content in worktrees
+        verified = len(successes) == self.num_agents
+        for r in successes:
+            wt_path = r.get("wt_dir")
+            fpath = os.path.join(wt_path, f"file_{r['agent']}.txt")
+            if not os.path.exists(fpath):
+                verified = False
+                break
 
         return {
             "system": "Git (Worktree per Agent)",
@@ -180,9 +199,9 @@ class BenchmarkRunner:
             "failures": len(failures),
             "error_rate_pct": (len(failures) / self.num_agents) * 100.0,
             "throughput_ops_sec": len(successes) / total_time if total_time > 0 else 0,
-            "median_latency_sec": statistics.median(latencies) if latencies else 0,
-            "p95_latency_sec": statistics.quantiles(latencies, n=20)[18] if len(latencies) >= 20 else max(latencies or [0]),
-            "content_verified": True
+            "median_latency_sec": median_lat,
+            "p95_latency_sec": p95_lat,
+            "content_verified": verified
         }
 
     def benchmark_aggit_python(self) -> Dict[str, Any]:
@@ -199,15 +218,18 @@ class BenchmarkRunner:
 
         successes = [r for r in results if r["success"]]
         failures = [r for r in results if not r["success"]]
-        latencies = [r["elapsed"] for r in results]
+        latencies = sorted([r["elapsed"] for r in results])
 
         # Reconcile and materialize
         t_rec = time.time()
-        written, conflicts = engine.materialize()
+        written, conflicts = engine.materialize(force=False)
         rec_time = time.time() - t_rec
 
-        # Verify content
-        verified = True
+        median_lat = statistics.median(latencies) if latencies else 0
+        p95_lat = statistics.quantiles(latencies, n=20)[18] if len(latencies) >= 20 else max(latencies or [0])
+
+        # Verify physical content
+        verified = len(successes) == self.num_agents and len(conflicts) == 0
         for i in range(self.num_agents):
             fp = os.path.join(repo_dir, f"file_{i}.txt")
             if not os.path.exists(fp) or not open(fp, "rb").read().startswith(b"AgGit Python content"):
@@ -225,40 +247,61 @@ class BenchmarkRunner:
             "failures": len(failures),
             "error_rate_pct": (len(failures) / self.num_agents) * 100.0,
             "throughput_ops_sec": len(successes) / (total_time + rec_time) if (total_time + rec_time) > 0 else 0,
-            "median_latency_sec": statistics.median(latencies) if latencies else 0,
-            "p95_latency_sec": statistics.quantiles(latencies, n=20)[18] if len(latencies) >= 20 else max(latencies or [0]),
-            "content_verified": verified and len(conflicts) == 0
+            "median_latency_sec": median_lat,
+            "p95_latency_sec": p95_lat,
+            "content_verified": verified
         }
 
     def benchmark_aggit_rust(self) -> Dict[str, Any]:
-        repo_dir = os.path.join(self.temp_root, "aggit_rust")
-        os.makedirs(repo_dir, exist_ok=True)
-        exe_path = os.path.abspath("aggit.exe")
-        if not os.path.exists(exe_path):
-            exe_path = os.path.abspath("aggit-rs/target/release/aggit.exe")
+        # Cross-platform binary resolution
+        bin_names = ["aggit.exe", "aggit"] if sys.platform != "win32" else ["aggit.exe"]
+        candidates = [
+            os.path.abspath(os.path.join("aggit-rs", "target", "release", "aggit.exe")),
+            os.path.abspath(os.path.join("aggit-rs", "target", "release", "aggit")),
+            os.path.abspath("aggit.exe"),
+            os.path.abspath("aggit"),
+        ]
 
-        t0 = time.time()
-        proc = subprocess.run([exe_path, "benchmark", "--agents", str(self.num_agents)], cwd=self.temp_root, capture_output=True, text=True)
-        total_time = time.time() - t0
+        exe_path = None
+        for cand in candidates:
+            if os.path.exists(cand):
+                exe_path = cand
+                break
 
-        stdout = proc.stdout
-        success = proc.returncode == 0
+        if not exe_path:
+            # Build release binary from source
+            subprocess.run(["cargo", "build", "--release", "--manifest-path", "aggit-rs/Cargo.toml"], check=True)
+            for cand in candidates:
+                if os.path.exists(cand):
+                    exe_path = cand
+                    break
 
-        # Parse throughput from output
-        ops_sec = self.num_agents / total_time if total_time > 0 else 0
+        proc = subprocess.run(
+            [exe_path, "benchmark", "--agents", str(self.num_agents), "--json"],
+            cwd=self.temp_root,
+            capture_output=True,
+            text=True
+        )
+
+        if proc.returncode == 0:
+            try:
+                data = json.loads(proc.stdout.strip())
+                return data
+            except Exception:
+                pass
 
         return {
             "system": "AgGit (Rust Native Engine)",
             "agents": self.num_agents,
             "concurrency": self.concurrency,
-            "total_time_sec": total_time,
-            "successes": self.num_agents if success else 0,
-            "failures": 0 if success else self.num_agents,
-            "error_rate_pct": 0.0 if success else 100.0,
-            "throughput_ops_sec": ops_sec,
-            "median_latency_sec": total_time / self.num_agents if self.num_agents else 0,
-            "p95_latency_sec": (total_time / self.num_agents) * 1.5 if self.num_agents else 0,
-            "content_verified": success
+            "total_time_sec": 0.0,
+            "successes": 0,
+            "failures": self.num_agents,
+            "error_rate_pct": 100.0,
+            "throughput_ops_sec": 0.0,
+            "median_latency_sec": 0.0,
+            "p95_latency_sec": 0.0,
+            "content_verified": False
         }
 
 def run_benchmarks():
@@ -318,8 +361,6 @@ def run_benchmarks():
             if not r["content_verified"] or r["failures"] > 0:
                 print(f"[FATAL] Content verification or run failed for {r['system']}!")
                 sys.exit(1)
-
-    print("[SUCCESS] All AgGit integrity checks and content verifications passed!")
 
 if __name__ == "__main__":
     run_benchmarks()
