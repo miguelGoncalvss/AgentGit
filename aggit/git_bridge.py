@@ -1,31 +1,29 @@
 """
-AgGit Git & GitHub Bridge:
-Provides robust, isolated integration between AgGit and Git/GitHub.
+AgGit Git & GitHub Interoperability Bridge:
+Enables exporting AgGit virtual revisions into native Git branches,
+pushing to Git remotes, and creating GitHub Pull Requests via GitHub CLI (`gh`).
 Guarantees:
-- Clear separation: prepare export, local commit, push, PR creation.
-- Uses isolated branch and temporary worktree (never pollutes or touches main working tree).
-- Exports only paths in export plan (never 'git add .').
-- Respects branch_name parameter and validates branch naming.
-- Structured subprocess execution without shell interpolation.
-- Full error context, exit code, stdout, and stderr capture.
-- Repeatable export: avoids duplicate commits/PRs for identical revisions via mapping ledger.
-- Safe GitHub CLI (gh) integration with clear diagnostics when gh or auth is missing.
-- Safe Git state import (bootstrap session from known Git commit).
+- Pure dry-run preview without mutating state or checkpoints
+- Full isolation: operations run in temporary git worktrees without mutating the user workspace
+- Branch continuity: continues on existing export branch without resetting ancestry
+- Strict preservation of unrelated Git files not touched by AgGit
+- Deletions in Git are only executed for paths explicitly deleted in AgGit
+- Blocks export when unresolved merge conflicts exist
+- Import accurately preserves .github/, .gitignore, and .gitattributes
 """
 
 import os
 import re
 import json
+import uuid
 import shutil
 import tempfile
 import subprocess
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Any
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Any
 from .engine import AgGitEngine
 from .semantic_merge import MergeConflict
-from .schema import TransactionRecord
-
-BRANCH_NAME_REGEX = re.compile(r"^[a-zA-Z0-9_\-\./]+$")
+from .schema import ChangeRecord
 
 @dataclass
 class ExportPlan:
@@ -39,17 +37,17 @@ class ExportPlan:
 
 @dataclass
 class ExportResult:
-    status: str  # "success", "no_changes", "conflict", "error", "cached"
+    status: str  # "success", "no_changes", "cached", "conflict", "failed"
     branch_name: str
     git_commit_hash: Optional[str] = None
     message: str = ""
-    details: Dict[str, Any] = None
+    details: Dict[str, Any] = field(default_factory=dict)
 
 class GitBridge:
     def __init__(self, engine: AgGitEngine):
         self.engine = engine
         self.repo_dir = engine.repo_dir
-        self.export_map_path = os.path.join(self.engine.aggit_dir, "git_export_map.json")
+        self.export_map_path = os.path.join(self.repo_dir, ".aggit", "git_export_map.json")
 
     def _load_export_map(self) -> Dict[str, Any]:
         if os.path.exists(self.export_map_path):
@@ -61,7 +59,7 @@ class GitBridge:
         return {}
 
     def _save_export_map(self, mapping: Dict[str, Any]):
-        tmp = self.export_map_path + f".tmp_{os.getpid()}.tmp"
+        tmp = self.export_map_path + f".tmp_{os.getpid()}_{uuid.uuid4().hex}.tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(mapping, f, indent=2, sort_keys=True)
@@ -74,9 +72,12 @@ class GitBridge:
                     pass
 
     def validate_branch_name(self, branch_name: str) -> str:
+        """Sanitizes and validates branch name according to git check-ref-format rules."""
         clean = branch_name.strip()
-        if not clean or not BRANCH_NAME_REGEX.match(clean) or ".." in clean or clean.endswith("/") or clean.startswith("/"):
-            raise ValueError(f"Invalid git branch name: '{branch_name}'")
+        if not clean:
+            raise ValueError("Branch name cannot be empty")
+        if re.search(r"[\s~^:?*\[\\]", clean) or clean.startswith("-") or clean.endswith("/") or clean.endswith(".lock"):
+            raise ValueError(f"Invalid branch name syntax: '{clean}'")
         return clean
 
     def prepare_export_plan(
@@ -86,7 +87,7 @@ class GitBridge:
         base_branch: str = "main"
     ) -> ExportPlan:
         """
-        Reconciles AgGit state in-memory WITHOUT modifying the working directory.
+        Reconciles AgGit state in-memory WITHOUT modifying the working directory or checkpoints.
         Identifies exact additions, modifications, deletions, and any conflicts.
         """
         valid_branch = self.validate_branch_name(branch_name)
@@ -96,11 +97,11 @@ class GitBridge:
             conflicts: List[MergeConflict] = []
             rev_id = target_revision
         else:
-            files_to_write, conflicts = self.engine.reconcile_state()
+            files_to_write, conflicts = self.engine.reconcile_state(dry_run=True)
             latest = self.engine.journal.get_latest_transaction()
             rev_id = latest.tx_id if latest else "genesis"
 
-        # Check files to delete against base branch if Git repo exists
+        # Check files to delete against base branch ONLY if explicitly deleted in AgGit
         files_to_delete: List[str] = []
         git_dir = os.path.join(self.repo_dir, ".git")
         if os.path.exists(git_dir):
@@ -108,9 +109,18 @@ class GitBridge:
             proc = subprocess.run(cmd, cwd=self.repo_dir, capture_output=True, text=True, encoding="utf-8")
             if proc.returncode == 0:
                 base_files = set(proc.stdout.splitlines())
-                for bf in base_files:
-                    if bf not in files_to_write and not bf.startswith(".git") and not bf.startswith(".aggit"):
-                        files_to_delete.append(bf)
+                # Find paths explicitly marked deleted in AgGit history
+                deleted_in_aggit = set()
+                for tx in self.engine.journal.get_all_transactions():
+                    for p, ch in tx.changes.items():
+                        if ch.action == "delete":
+                            deleted_in_aggit.add(p)
+                        elif p in deleted_in_aggit:
+                            deleted_in_aggit.remove(p)
+
+                for del_path in deleted_in_aggit:
+                    if del_path in base_files and del_path not in files_to_write:
+                        files_to_delete.append(del_path)
 
         return ExportPlan(
             revision_tx_id=rev_id,
@@ -152,8 +162,8 @@ class GitBridge:
     ) -> ExportResult:
         """
         Exports the AgGit revision to an isolated Git branch using a temporary worktree.
+        Preserves branch continuity and ancestor history without reset.
         Never touches the user's main workspace files.
-        Guarantees idempotence: re-exporting the same revision to the same branch returns previous commit.
         """
         valid_branch = self.validate_branch_name(branch_name)
 
@@ -164,63 +174,87 @@ class GitBridge:
                 status="conflict",
                 branch_name=valid_branch,
                 message=f"Export blocked: {len(plan.conflicts)} unresolved merge conflicts.",
-                details={"conflicts": [{"path": c.path, "type": c.conflict_type} for c in plan.conflicts]}
+                details={"conflicts": [c.to_dict() for c in plan.conflicts]}
             )
 
-        # 2. Check idempotent mapping ledger
-        ledger_key = f"{plan.revision_tx_id}::{valid_branch}"
-        mapping = self._load_export_map()
-        if ledger_key in mapping:
-            existing = mapping[ledger_key]
-            return ExportResult(
-                status="cached",
-                branch_name=valid_branch,
-                git_commit_hash=existing.get("git_commit_hash"),
-                message="Revision already exported to this branch. Returning existing commit.",
-                details=existing
-            )
-
-        # 3. Ensure Git is initialized
+        # 2. Ensure Git is initialized
         git_dir = os.path.join(self.repo_dir, ".git")
         if not os.path.exists(git_dir):
             subprocess.run(["git", "init"], cwd=self.repo_dir, check=True, capture_output=True)
 
-        # Ensure base branch exists; if empty repo, create initial commit on base branch
+        # Check if repo has any commits yet
         rev_check = subprocess.run(["git", "rev-parse", "--verify", "HEAD"], cwd=self.repo_dir, capture_output=True)
         if rev_check.returncode != 0:
-            # Empty repo
-            dummy_file = os.path.join(self.repo_dir, ".gitkeep")
-            with open(dummy_file, "w") as f:
-                f.write("")
-            subprocess.run(["git", "add", ".gitkeep"], cwd=self.repo_dir, check=True, capture_output=True)
-            subprocess.run(["git", "commit", "-m", "chore: initial repository structure"], cwd=self.repo_dir, check=True, capture_output=True)
-            if os.path.exists(dummy_file):
-                os.remove(dummy_file)
+            # Empty repo: create initial commit on empty tree via git plumbing without touching user index/workspace
+            empty_tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+            subprocess.run(["git", "mktree"], input=b"", cwd=self.repo_dir, capture_output=True)
+            c_proc = subprocess.run(["git", "commit-tree", empty_tree, "-m", "chore: initial repository structure"], cwd=self.repo_dir, capture_output=True, text=True)
+            if c_proc.returncode == 0:
+                root_commit = c_proc.stdout.strip()
+                subprocess.run(["git", "update-ref", f"refs/heads/{base_branch}", root_commit], cwd=self.repo_dir, capture_output=True)
+                subprocess.run(["git", "symbolic-ref", "HEAD", f"refs/heads/{base_branch}"], cwd=self.repo_dir, capture_output=True)
 
-        # 4. Create isolated worktree for the target branch
+        # Check if the target branch already exists in Git
+        branch_check = subprocess.run(
+            ["git", "rev-parse", "--verify", f"refs/heads/{valid_branch}"],
+            cwd=self.repo_dir,
+            capture_output=True,
+            text=True
+        )
+        branch_exists = (branch_check.returncode == 0)
+
+        # Determine parent commit on the target branch or base branch
+        if branch_exists:
+            current_branch_tip = branch_check.stdout.strip()
+        else:
+            base_check = subprocess.run(["git", "rev-parse", "--verify", base_branch], cwd=self.repo_dir, capture_output=True, text=True)
+            current_branch_tip = base_check.stdout.strip() if base_check.returncode == 0 else ""
+
+        # Check idempotent mapping ledger
+        ledger_key = f"{plan.revision_tx_id}::{valid_branch}::{current_branch_tip}"
+        mapping = self._load_export_map()
+        if ledger_key in mapping:
+            existing = mapping[ledger_key]
+            cached_commit = existing.get("git_commit_hash")
+            # Verify commit still exists in git object DB
+            if cached_commit and subprocess.run(["git", "cat-file", "-e", cached_commit], cwd=self.repo_dir, capture_output=True).returncode == 0:
+                return ExportResult(
+                    status="cached",
+                    branch_name=valid_branch,
+                    git_commit_hash=cached_commit,
+                    message="Revision already exported to this branch. Returning existing commit.",
+                    details=existing
+                )
+
+        # 3. Create isolated worktree for the target branch
         temp_worktree = tempfile.mkdtemp(prefix="aggit_worktree_")
         try:
-            # Add or checkout worktree on isolated branch
-            add_wt_cmd = ["git", "worktree", "add", "-B", valid_branch, temp_worktree, base_branch]
-            wt_proc = subprocess.run(add_wt_cmd, cwd=self.repo_dir, capture_output=True, text=True, encoding="utf-8")
-            if wt_proc.returncode != 0:
-                # Try checkout without base_branch if already exists
-                add_wt_cmd2 = ["git", "worktree", "add", "-B", valid_branch, temp_worktree]
-                wt_proc2 = subprocess.run(add_wt_cmd2, cwd=self.repo_dir, capture_output=True, text=True, encoding="utf-8")
-                if wt_proc2.returncode != 0:
-                    raise RuntimeError(f"Failed to create Git worktree: {wt_proc2.stderr.strip()}")
+            if not branch_exists:
+                # Create branch from base_branch
+                add_wt_cmd = ["git", "worktree", "add", "-b", valid_branch, temp_worktree, base_branch]
+                wt_proc = subprocess.run(add_wt_cmd, cwd=self.repo_dir, capture_output=True, text=True, encoding="utf-8")
+                if wt_proc.returncode != 0:
+                    # Fallback without base_branch
+                    add_wt_cmd2 = ["git", "worktree", "add", "-b", valid_branch, temp_worktree]
+                    wt_proc2 = subprocess.run(add_wt_cmd2, cwd=self.repo_dir, capture_output=True, text=True, encoding="utf-8")
+                    if wt_proc2.returncode != 0:
+                        raise RuntimeError(f"Failed to create Git worktree: {wt_proc2.stderr.strip()}")
+            else:
+                # Branch already exists: checkout directly to continue history!
+                add_wt_cmd = ["git", "worktree", "add", temp_worktree, valid_branch]
+                wt_proc = subprocess.run(add_wt_cmd, cwd=self.repo_dir, capture_output=True, text=True, encoding="utf-8")
+                if wt_proc.returncode != 0:
+                    raise RuntimeError(f"Failed to checkout Git worktree on existing branch: {wt_proc.stderr.strip()}")
 
-            # 5. Apply only the files belonging to the export plan inside worktree
-            staged_paths: List[str] = []
-
-            # Handle deletions
+            # 4. Apply deletions
             for del_path in plan.files_to_delete:
                 full_del = os.path.join(temp_worktree, del_path)
                 if os.path.exists(full_del):
                     os.remove(full_del)
                     subprocess.run(["git", "rm", "-f", "--ignore-unmatch", "--", del_path], cwd=temp_worktree, capture_output=True)
 
-            # Handle additions / modifications
+            # 5. Apply additions and modifications
+            staged_paths: List[str] = []
             for rel_path, content in plan.files_to_write.items():
                 target_file = os.path.join(temp_worktree, rel_path)
                 os.makedirs(os.path.dirname(target_file), exist_ok=True)
@@ -228,9 +262,8 @@ class GitBridge:
                     f.write(content)
                 staged_paths.append(rel_path)
 
-            # Stage only planned files (never 'git add .')
+            # Stage only planned files
             if staged_paths:
-                # Batch git add in chunks if necessary
                 chunk_size = 50
                 for i in range(0, len(staged_paths), chunk_size):
                     chunk = staged_paths[i:i + chunk_size]
@@ -257,126 +290,110 @@ class GitBridge:
                     )
                 raise RuntimeError(f"Git commit failed: {commit_proc.stderr.strip()}")
 
-            # 7. Obtain exact newly created commit hash
-            rev_proc = subprocess.run(["git", "rev-parse", "HEAD"], cwd=temp_worktree, capture_output=True, text=True)
-            commit_hash = rev_proc.stdout.strip()
+            rev_hash = subprocess.run(["git", "rev-parse", "HEAD"], cwd=temp_worktree, capture_output=True, text=True).stdout.strip()
 
-            # 8. Record mapping in ledger
+            # Record in idempotent export mapping ledger
             mapping[ledger_key] = {
                 "revision_tx_id": plan.revision_tx_id,
-                "git_commit_hash": commit_hash,
                 "branch_name": valid_branch,
-                "base_branch": base_branch
+                "git_commit_hash": rev_hash,
+                "parent_git_commit": current_branch_tip
             }
             self._save_export_map(mapping)
 
             return ExportResult(
                 status="success",
                 branch_name=valid_branch,
-                git_commit_hash=commit_hash,
-                message=f"Successfully exported AgGit revision to Git commit {commit_hash[:8]} on branch '{valid_branch}'."
+                git_commit_hash=rev_hash,
+                message=f"Exported revision {plan.revision_tx_id[:8]} to Git branch '{valid_branch}' (commit: {rev_hash[:8]})",
+                details={"commit_hash": rev_hash}
             )
 
         finally:
-            # Cleanup worktree
+            # Safely remove worktree
             subprocess.run(["git", "worktree", "remove", "--force", temp_worktree], cwd=self.repo_dir, capture_output=True)
             if os.path.exists(temp_worktree):
-                try:
-                    shutil.rmtree(temp_worktree)
-                except OSError:
-                    pass
+                shutil.rmtree(temp_worktree, ignore_errors=True)
 
-    def push_to_remote(
-        self,
-        branch_name: str = "aggit/sync",
-        remote: str = "origin",
-        set_upstream: bool = True
-    ) -> Dict[str, Any]:
-        """
-        Explicitly pushes an exported branch to a Git remote.
-        Never runs automatically. Structured parameters, no force-push.
-        """
+    def push_to_remote(self, branch_name: str, remote_name: str = "origin", remote: Optional[str] = None) -> Dict[str, Any]:
+        """Pushes an exported branch to a Git remote."""
+        target_remote = remote or remote_name
         valid_branch = self.validate_branch_name(branch_name)
-        cmd = ["git", "push"]
-        if set_upstream:
-            cmd.extend(["-u", remote, valid_branch])
-        else:
-            cmd.extend([remote, valid_branch])
+        remote_check = subprocess.run(["git", "remote", "get-url", target_remote], cwd=self.repo_dir, capture_output=True, text=True)
+        if remote_check.returncode != 0:
+            return {
+                "success": False,
+                "status": "skipped",
+                "message": f"Remote '{target_remote}' is not configured in this Git repository.",
+                "action_required": f"Run 'git remote add {target_remote} <url>' to configure."
+            }
 
-        proc = subprocess.run(cmd, cwd=self.repo_dir, capture_output=True, text=True, encoding="utf-8")
+        push_cmd = ["git", "push", "-u", target_remote, f"{valid_branch}:{valid_branch}"]
+        proc = subprocess.run(push_cmd, cwd=self.repo_dir, capture_output=True, text=True, encoding="utf-8")
         if proc.returncode != 0:
             return {
                 "success": False,
-                "error": "push_rejected",
-                "stderr": proc.stderr.strip(),
-                "guidance": "Remote rejected push (likely non-fast-forward). Reconcile remote changes before retrying."
+                "status": "failed",
+                "error": proc.stderr.strip(),
+                "message": f"Git push to '{target_remote}/{valid_branch}' failed."
             }
+
         return {
             "success": True,
-            "remote": remote,
+            "status": "pushed",
+            "remote": target_remote,
             "branch": valid_branch,
-            "output": proc.stdout.strip()
+            "message": f"Successfully pushed branch '{valid_branch}' to remote '{target_remote}'."
         }
 
     def create_or_update_pr(
         self,
-        branch_name: str = "aggit/sync",
+        branch_name: str,
         base_branch: str = "main",
         title: Optional[str] = None,
         body: Optional[str] = None
     ) -> Dict[str, Any]:
-        """
-        Uses GitHub CLI (gh) to create or reuse a Pull Request.
-        Checks tool availability and auth status gracefully.
-        """
+        """Creates or updates a GitHub Pull Request via GitHub CLI (`gh`)."""
         valid_branch = self.validate_branch_name(branch_name)
-
-        # Check if gh is installed
-        gh_check = shutil.which("gh")
-        if not gh_check:
+        gh_check = subprocess.run(["gh", "--version"], capture_output=True, text=True)
+        if gh_check.returncode != 0:
             return {
                 "status": "gh_not_installed",
-                "message": "GitHub CLI (gh) is not installed on this system.",
-                "guidance": f"Install gh from https://cli.github.com or open PR manually from branch '{valid_branch}'."
+                "message": "GitHub CLI (`gh`) is not installed or not in PATH.",
+                "action_required": "Install `gh` (e.g. `winget install GitHub.cli` or `brew install gh`) or open PR via github.com."
             }
 
-        # Check gh auth
-        auth_proc = subprocess.run(["gh", "auth", "status"], cwd=self.repo_dir, capture_output=True, text=True)
-        if auth_proc.returncode != 0:
-            return {
-                "status": "gh_unauthenticated",
-                "message": "GitHub CLI is not authenticated.",
-                "guidance": "Run 'gh auth login' to authenticate with your GitHub account."
-            }
+        check_pr_cmd = ["gh", "pr", "view", valid_branch, "--json", "number,url,state"]
+        check_proc = subprocess.run(check_pr_cmd, cwd=self.repo_dir, capture_output=True, text=True)
 
-        # Check if PR already exists for this head branch
-        list_cmd = ["gh", "pr", "list", "--head", valid_branch, "--base", base_branch, "--json", "number,url,state,title"]
-        list_proc = subprocess.run(list_cmd, cwd=self.repo_dir, capture_output=True, text=True)
-        if list_proc.returncode == 0:
+        pr_title = title or f"feat(aggit): sync changes from {valid_branch}"
+        pr_body = body or f"Automated Pull Request synchronizing AgGit revisions from branch `{valid_branch}` into `{base_branch}`."
+
+        if check_proc.returncode == 0:
             try:
-                prs = json.loads(list_proc.stdout)
-                if prs:
-                    existing_pr = prs[0]
-                    return {
-                        "status": "reused",
-                        "pr_number": existing_pr.get("number"),
-                        "pr_url": existing_pr.get("url"),
-                        "message": f"Found existing Pull Request #{existing_pr.get('number')}: {existing_pr.get('url')}"
-                    }
+                pr_data = json.loads(check_proc.stdout)
+                pr_url = pr_data.get("url")
+                return {
+                    "status": "already_exists",
+                    "pr_url": pr_url,
+                    "message": f"Pull Request for '{valid_branch}' already exists: {pr_url}"
+                }
             except Exception:
                 pass
 
-        # Create PR
-        pr_title = title or f"AgGit: Autonomous multi-agent sync from {valid_branch}"
-        pr_body = body or "Automated Pull Request prepared by AgGit (Lock-Free Multi-Agent Version Control)."
-
-        create_cmd = ["gh", "pr", "create", "--head", valid_branch, "--base", base_branch, "--title", pr_title, "--body", pr_body]
+        create_cmd = [
+            "gh", "pr", "create",
+            "--head", valid_branch,
+            "--base", base_branch,
+            "--title", pr_title,
+            "--body", pr_body
+        ]
         create_proc = subprocess.run(create_cmd, cwd=self.repo_dir, capture_output=True, text=True)
         if create_proc.returncode != 0:
             return {
-                "status": "error",
-                "stderr": create_proc.stderr.strip(),
-                "message": "Failed to create Pull Request via gh."
+                "status": "failed",
+                "error": create_proc.stderr.strip(),
+                "message": f"Failed to create Pull Request via `gh`: {create_proc.stderr.strip()}"
             }
 
         pr_url = create_proc.stdout.strip()
@@ -390,20 +407,18 @@ class GitBridge:
         """
         Imports a Git commit snapshot into AgGit as a baseline revision.
         Enables bootstrapping an AgGit multi-agent session from a known Git state.
+        Preserves .github/, .gitignore, and .gitattributes by exact directory matching.
         """
-        # Resolve full 40-char SHA
         rev_proc = subprocess.run(["git", "rev-parse", commit_ref], cwd=self.repo_dir, capture_output=True, text=True)
         if rev_proc.returncode != 0:
             raise ValueError(f"Invalid Git commit or ref: '{commit_ref}'")
         full_commit_sha = rev_proc.stdout.strip()
 
-        # Read git tree
         tree_proc = subprocess.run(["git", "ls-tree", "-r", "-z", full_commit_sha], cwd=self.repo_dir, capture_output=True)
         if tree_proc.returncode != 0:
             raise RuntimeError(f"Failed to read Git tree for {full_commit_sha}")
 
         changes = {}
-        # Parse ls-tree -r -z output: "<mode> <type> <object>\t<file>\0"
         entries = tree_proc.stdout.split(b"\0")
         for entry in entries:
             if not entry:
@@ -413,17 +428,15 @@ class GitBridge:
                 continue
             path_bytes = entry[tab_idx + 1:]
             rel_path = path_bytes.decode("utf-8", errors="replace")
-            if rel_path.startswith(".git") or rel_path.startswith(".aggit"):
+
+            # Check exact directory components, not startswith('.git')
+            parts = rel_path.replace("\\", "/").split("/")
+            if parts[0] in {".git", ".aggit"}:
                 continue
 
-            # Read file bytes from git object database
             cat_proc = subprocess.run(["git", "cat-file", "-p", f"{full_commit_sha}:{rel_path}"], cwd=self.repo_dir, capture_output=True)
             if cat_proc.returncode == 0:
                 blob_sha = self.engine.storage.store_blob(cat_proc.stdout)
-                changes[rel_path] = self.engine.staging.get_staged_changes("system").get(rel_path) or None
-                changes[rel_path] = self.engine.staging.get_staged_changes("system").get(rel_path) or \
-                    type(self.engine.journal.get_latest_transaction()) # fallback placeholder
-                from .schema import ChangeRecord
                 changes[rel_path] = ChangeRecord(action="add", blob_sha=blob_sha)
 
         tx = self.engine.journal.append_transaction(
