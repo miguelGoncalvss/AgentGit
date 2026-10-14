@@ -1,0 +1,54 @@
+name: AgGit CI
+
+on:
+  push:
+    branches: [ main, "feat/**" ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test-matrix:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ ubuntu-latest, windows-latest ]
+        python-version: [ "3.11", "3.12" ]
+        rust-version: [ stable ]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Setup Rust ${{ matrix.rust-version }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust-version }}
+
+      - name: Configure Git for Testing
+        run: |
+          git config --global user.name "AgGit CI"
+          git config --global user.email "ci@aggit.local"
+
+      - name: Run Python Regression Tests
+        run: |
+          python tests/test_all_regressions.py -v
+
+      - name: Build Rust Engine
+        working-directory: ./aggit-rs
+        run: |
+          cargo build --release
+
+      - name: Run Rust Tests
+        working-directory: ./aggit-rs
+        run: |
+          cargo test --verbose
+
+      - name: Run Sanity Benchmark
+        run: |
+          python benchmark.py
