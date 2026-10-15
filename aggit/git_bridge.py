@@ -25,6 +25,7 @@ from typing import Dict, List, Optional, Any
 from .engine import AgGitEngine
 from .semantic_merge import SemanticMerger, MergeConflict
 from .schema import ChangeRecord
+from .path_utils import is_path_contained
 
 @dataclass
 class ExportPlan:
@@ -84,28 +85,39 @@ class GitBridge:
 
     @staticmethod
     def _validate_safe_path(base_dir: str, rel_path: str) -> str:
+        if not rel_path or not rel_path.strip():
+            raise ValueError("Path cannot be empty or whitespace only")
+        if "\0" in rel_path:
+            raise ValueError(f"Null byte detected in path: '{rel_path}'")
+
+        # Disallow Windows drive prefixes or UNC paths
+        if ":" in rel_path or rel_path.startswith("\\\\") or rel_path.startswith("//"):
+            raise ValueError(f"Absolute or drive/UNC paths not allowed: '{rel_path}'")
+
         norm = os.path.normpath(rel_path).replace("\\", "/")
-        if norm.startswith("../") or norm == ".." or os.path.isabs(norm):
+        parts = [p for p in norm.split("/") if p]
+        if any(part == ".." for part in parts) or norm.startswith("/") or os.path.isabs(norm):
             raise ValueError(f"Directory traversal detected: '{rel_path}'")
-        
-        full = os.path.abspath(os.path.join(base_dir, norm))
-        real_base = os.path.realpath(base_dir)
-        
-        cur = os.path.dirname(full)
-        while cur and cur != real_base:
-            if os.path.islink(cur):
-                target = os.path.realpath(cur)
-                if not target.startswith(real_base):
-                    raise ValueError(f"Symlink traversal detected: '{rel_path}' points outside worktree")
-            cur = os.path.dirname(cur)
 
-        if os.path.islink(full):
-            target = os.path.realpath(full)
-            if not target.startswith(real_base):
-                raise ValueError(f"Symlink traversal detected: '{rel_path}' points outside worktree")
+        abs_base = os.path.abspath(base_dir)
+        full = os.path.abspath(os.path.join(abs_base, norm))
 
-        if not full.startswith(real_base):
+        # Check containment via component-wise canonical comparison
+        if not is_path_contained(full, abs_base):
             raise ValueError(f"Path escapes worktree: '{rel_path}'")
+
+        # Walk up from full to abs_base to ensure no intermediate symlink escapes
+        curr = full
+        base_norm = os.path.normcase(abs_base)
+        while True:
+            if os.path.islink(curr):
+                real_target = os.path.realpath(curr)
+                if not is_path_contained(real_target, abs_base):
+                    raise ValueError(f"Symlink traversal detected: '{rel_path}' points outside worktree")
+            parent = os.path.dirname(curr)
+            if parent == curr or os.path.normcase(os.path.abspath(curr)) == base_norm:
+                break
+            curr = parent
 
         return full
 
@@ -133,20 +145,56 @@ class GitBridge:
         Preserves external changes made to untouched files on the destination branch.
         """
         valid_branch = self.validate_branch_name(branch_name)
-        if target_revision:
-            tree_map = self.engine.get_revision_tree(target_revision)
-            unified_files = {p: self.engine.storage.get_blob(sha) for p, sha in tree_map.items()}
-            conflicts: List[MergeConflict] = []
-            rev_id = target_revision
-        else:
-            unified_files, conflicts = self.engine.reconcile_state(dry_run=True)
-            latest = self.engine.journal.get_latest_transaction()
-            rev_id = latest.tx_id if latest else "genesis"
 
-        current_aggit_tree = {
-            p: hashlib.sha256(content).hexdigest()
-            for p, content in unified_files.items()
-        }
+        orig_read_only = getattr(self.engine.journal, "read_only", False)
+        self.engine.journal.read_only = True
+        try:
+            if target_revision:
+                tree_map = self.engine.get_revision_tree(target_revision)
+                unified_files = {p: self.engine.storage.get_blob(sha) for p, sha in tree_map.items()}
+                conflicts: List[MergeConflict] = []
+                rev_id = target_revision
+            else:
+                unified_files, conflicts = self.engine.reconcile_state(dry_run=True)
+                latest = self.engine.journal.get_latest_transaction()
+                rev_id = latest.tx_id if latest else "genesis"
+        finally:
+            self.engine.journal.read_only = orig_read_only
+
+        current_aggit_tree = {}
+        for p, content in unified_files.items():
+            header = f"blob {len(content)}\0".encode("utf-8")
+            cas_sha = hashlib.sha256(header + content).hexdigest()
+            current_aggit_tree[p] = cas_sha
+
+        # Inspect current state in Git repository
+        branch_check = subprocess.run(
+            ["git", "rev-parse", "--verify", f"refs/heads/{valid_branch}"],
+            cwd=self.repo_dir,
+            capture_output=True,
+            text=True
+        )
+        branch_exists = (branch_check.returncode == 0)
+        current_git_ref = valid_branch if branch_exists else base_branch
+
+        git_files: Dict[str, str] = {}
+        if os.path.exists(os.path.join(self.repo_dir, ".git")):
+            ls_proc = subprocess.run(
+                ["git", "ls-tree", "-r", "-z", current_git_ref],
+                cwd=self.repo_dir,
+                capture_output=True
+            )
+            if ls_proc.returncode == 0:
+                raw_entries = ls_proc.stdout.split(b"\0")
+                for entry in raw_entries:
+                    if not entry:
+                        continue
+                    tab_idx = entry.find(b"\t")
+                    if tab_idx != -1:
+                        path_str = entry[tab_idx + 1:].decode("utf-8", errors="replace").replace("\\", "/")
+                        parts = entry[:tab_idx].split()
+                        blob_sha = parts[2].decode("ascii", errors="replace") if len(parts) >= 3 else ""
+                        git_files[path_str] = blob_sha
 
         mapping = self._load_export_map()
         branch_state = mapping.get("branches", {}).get(valid_branch)
@@ -158,30 +206,53 @@ class GitBridge:
             last_aggit_tree = branch_state["last_aggit_tree"]
             last_git_commit = branch_state.get("last_git_commit")
 
-            # 1. AgGit added: in current but not in last
-            for p, cur_hash in current_aggit_tree.items():
-                if p not in last_aggit_tree:
-                    files_to_write[p] = unified_files[p]
+            # Determine all paths touched by AgGit previously or currently
+            # Untouched external files in git_files are naturally preserved
+            all_candidate_paths = set(current_aggit_tree.keys()) | set(last_aggit_tree.keys())
 
-            # 2. AgGit deleted: in last but not in current
-            for p in last_aggit_tree:
-                if p not in current_aggit_tree:
-                    files_to_delete.append(p)
+            for p in all_candidate_paths:
+                cur_aggit_bytes = unified_files.get(p)
+                cur_aggit_sha = current_aggit_tree.get(p)
+                last_aggit_sha = last_aggit_tree.get(p)
+                last_aggit_bytes = self.engine.storage.get_blob(last_aggit_sha) if last_aggit_sha else None
 
-            # 3. AgGit modified: in both with different content hashes
-            for p, cur_hash in current_aggit_tree.items():
-                if p in last_aggit_tree and last_aggit_tree[p] != cur_hash:
-                    aggit_bytes = unified_files[p]
-                    if last_git_commit:
-                        base_git_bytes = self._get_git_file_bytes(self.repo_dir, last_git_commit, p)
-                        cur_git_bytes = self._get_git_file_bytes(self.repo_dir, valid_branch, p)
-                        if cur_git_bytes is not None and base_git_bytes is not None and cur_git_bytes != base_git_bytes:
-                            # Both modified: 3-way merge
+                cur_git_bytes = self._get_git_file_bytes(self.repo_dir, current_git_ref, p) if p in git_files else None
+                last_git_bytes = self._get_git_file_bytes(self.repo_dir, last_git_commit, p) if last_git_commit else None
+
+                aggit_changed = (cur_aggit_sha != last_aggit_sha)
+                git_changed = (cur_git_bytes != last_git_bytes) if last_git_commit else (cur_git_bytes is not None)
+
+                # 1. Neither side changed
+                if not aggit_changed and not git_changed:
+                    continue
+
+                # 2. Only Git changed externally: PRESERVE Git!
+                if not aggit_changed and git_changed:
+                    continue
+
+                # 3. AgGit changed, Git tip did not change since last export
+                if aggit_changed and not git_changed:
+                    # Check if Git has previously integrated external changes relative to AgGit's base
+                    if cur_git_bytes is not None and last_aggit_bytes is not None and cur_git_bytes != last_aggit_bytes:
+                        if cur_aggit_bytes is None:
+                            # AgGit deleted, but Git has integrated changes -> conflict!
+                            conflicts.append(MergeConflict(
+                                path=p,
+                                conflict_type="modify_delete",
+                                details=f"File '{p}' deleted in AgGit but has integrated Git modifications",
+                                base_sha=last_aggit_sha,
+                                a_sha=hashlib.sha256(cur_git_bytes).hexdigest(),
+                                b_sha=None,
+                                label_a=f"git_{valid_branch}",
+                                label_b="aggit"
+                            ))
+                        else:
+                            # 3-way merge applying AgGit's delta onto Git's integrated content
                             merged_bytes, step_conflicts = SemanticMerger.merge_files(
                                 path=p,
-                                base_bytes=base_git_bytes,
+                                base_bytes=last_aggit_bytes,
                                 a_bytes=cur_git_bytes,
-                                b_bytes=aggit_bytes,
+                                b_bytes=cur_aggit_bytes,
                                 label_a=f"git_{valid_branch}",
                                 label_b="aggit"
                             )
@@ -189,37 +260,113 @@ class GitBridge:
                                 conflicts.extend(step_conflicts)
                             elif merged_bytes is not None:
                                 files_to_write[p] = merged_bytes
-                            continue
+                    else:
+                        # Clean unilateral AgGit change
+                        if cur_aggit_bytes is None:
+                            files_to_delete.append(p)
+                        else:
+                            files_to_write[p] = cur_aggit_bytes
+                    continue
 
-                    files_to_write[p] = aggit_bytes
+                # 4. Both sides changed concurrently (aggit_changed and git_changed)
+                if cur_aggit_bytes is None and cur_git_bytes is None:
+                    # Both deleted
+                    continue
+
+                if cur_aggit_bytes is None and cur_git_bytes is not None:
+                    # Scenario A: AgGit deleted, human modified in Git
+                    conflicts.append(MergeConflict(
+                        path=p,
+                        conflict_type="modify_delete",
+                        details=f"File '{p}' deleted in AgGit but modified externally in Git",
+                        base_sha=last_aggit_sha,
+                        a_sha=hashlib.sha256(cur_git_bytes).hexdigest(),
+                        b_sha=None,
+                        label_a=f"git_{valid_branch}",
+                        label_b="aggit"
+                    ))
+                    continue
+
+                if cur_aggit_bytes is not None and cur_git_bytes is None:
+                    # Scenario B: Human deleted in Git, AgGit modified
+                    conflicts.append(MergeConflict(
+                        path=p,
+                        conflict_type="modify_delete",
+                        details=f"File '{p}' modified in AgGit but deleted externally in Git",
+                        base_sha=last_aggit_sha,
+                        a_sha=None,
+                        b_sha=cur_aggit_sha,
+                        label_a=f"git_{valid_branch}",
+                        label_b="aggit"
+                    ))
+                    continue
+
+                # Both sides modified or added
+                assert cur_aggit_bytes is not None and cur_git_bytes is not None
+                if last_aggit_bytes is None and last_git_bytes is None:
+                    # Scenario C: Both added concurrently without common base
+                    if cur_aggit_bytes == cur_git_bytes:
+                        files_to_write[p] = cur_aggit_bytes
+                    else:
+                        conflicts.append(MergeConflict(
+                            path=p,
+                            conflict_type="add_add_divergence",
+                            details=f"File '{p}' added concurrently with differing content in Git and AgGit",
+                            base_sha=None,
+                            a_sha=hashlib.sha256(cur_git_bytes).hexdigest(),
+                            b_sha=cur_aggit_sha,
+                            label_a=f"git_{valid_branch}",
+                            label_b="aggit"
+                        ))
+                else:
+                    # 3-way merge with common base
+                    base_bytes = last_aggit_bytes or last_git_bytes
+                    merged_bytes, step_conflicts = SemanticMerger.merge_files(
+                        path=p,
+                        base_bytes=base_bytes,
+                        a_bytes=cur_git_bytes,
+                        b_bytes=cur_aggit_bytes,
+                        label_a=f"git_{valid_branch}",
+                        label_b="aggit"
+                    )
+                    if step_conflicts:
+                        conflicts.extend(step_conflicts)
+                    elif merged_bytes is not None:
+                        files_to_write[p] = merged_bytes
 
         else:
-            # First export to valid_branch: write all current AgGit files
-            files_to_write = dict(unified_files)
-            
-            # Check if any files from base_branch were deleted in AgGit
-            git_dir = os.path.join(self.repo_dir, ".git")
-            if os.path.exists(git_dir):
-                proc = subprocess.run(
-                    ["git", "ls-tree", "-r", "--name-only", base_branch],
-                    cwd=self.repo_dir,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8"
-                )
-                if proc.returncode == 0:
-                    base_files = set(proc.stdout.splitlines())
-                    deleted_in_aggit = set()
-                    for tx in self.engine.journal.get_all_transactions():
-                        for p, ch in tx.changes.items():
-                            if ch.action == "delete":
-                                deleted_in_aggit.add(p)
-                            elif p in deleted_in_aggit:
-                                deleted_in_aggit.remove(p)
+            # First export to valid_branch:
+            for p, cur_aggit_bytes in unified_files.items():
+                cur_git_bytes = self._get_git_file_bytes(self.repo_dir, current_git_ref, p) if p in git_files else None
+                if cur_git_bytes is None:
+                    files_to_write[p] = cur_aggit_bytes
+                else:
+                    if cur_aggit_bytes == cur_git_bytes:
+                        continue
+                    else:
+                        conflicts.append(MergeConflict(
+                            path=p,
+                            conflict_type="add_add_divergence",
+                            details=f"File '{p}' exists in both Git and AgGit with divergent content without baseline",
+                            base_sha=None,
+                            a_sha=hashlib.sha256(cur_git_bytes).hexdigest(),
+                            b_sha=hashlib.sha256(cur_aggit_bytes).hexdigest(),
+                            label_a=f"git_{valid_branch}",
+                            label_b="aggit"
+                        ))
 
-                    for del_path in deleted_in_aggit:
-                        if del_path in base_files and del_path not in unified_files:
-                            files_to_delete.append(del_path)
+            # Check if any files from current_git_ref were explicitly deleted in AgGit
+            deleted_in_aggit = set()
+            for tx in self.engine.journal.get_all_transactions():
+                for p, ch in tx.changes.items():
+                    if ch.action == "delete":
+                        deleted_in_aggit.add(p)
+                    elif p in deleted_in_aggit:
+                        deleted_in_aggit.remove(p)
+
+            for del_path in deleted_in_aggit:
+                if del_path in git_files and del_path not in unified_files:
+                    files_to_delete.append(del_path)
 
         return ExportPlan(
             revision_tx_id=rev_id,
@@ -239,7 +386,24 @@ class GitBridge:
         base_branch: str = "main"
     ) -> Dict[str, Any]:
         """Dry-run preview that details export changes without mutating workspace or creating Git commits."""
-        plan = self.prepare_export_plan(target_revision, branch_name, base_branch)
+        orig_read_only = getattr(self.engine.journal, "read_only", False)
+        self.engine.journal.read_only = True
+        try:
+            plan = self.prepare_export_plan(target_revision, branch_name, base_branch)
+            return {
+                "revision_tx_id": plan.revision_tx_id,
+                "target_branch": plan.branch_name,
+                "base_branch": plan.base_branch,
+                "is_clean": plan.is_clean,
+                "files_to_write_count": len(plan.files_to_write),
+                "files_to_write": sorted(list(plan.files_to_write.keys())),
+                "files_to_delete_count": len(plan.files_to_delete),
+                "files_to_delete": sorted(plan.files_to_delete),
+                "conflicts_count": len(plan.conflicts),
+                "conflicts": [{"path": c.path, "type": c.conflict_type, "details": c.details} for c in plan.conflicts]
+            }
+        finally:
+            self.engine.journal.read_only = orig_read_only
         return {
             "revision_tx_id": plan.revision_tx_id,
             "target_branch": plan.branch_name,

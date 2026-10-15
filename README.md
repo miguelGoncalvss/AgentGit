@@ -207,7 +207,7 @@ See [docs/benchmarks.md](docs/benchmarks.md) for full details.
 
 ## 🧪 Test Suite
 
-Over 40 comprehensive automated test scenarios across Python and 12 native Rust integration tests validate staging session locking, DAG reconciliation, conflict lifecycle, JSON recursive merge, pure dry-run CAS isolation, delimited Git export, 3-state pre-validation, and path security:
+50 comprehensive automated test scenarios across Python and 13 native Rust integration tests validate staging session locking, Windows path normalization & symlink containment, 3-way Git export matrix, conflict identity & lifecycle, JSON recursive merge, auto-healing persistence, pure dry-run CAS isolation, and linear reconciliation scaling:
 
 ```bash
 # Run all Python regression and deep integrity test suites:

@@ -29,7 +29,34 @@ pub struct MergeConflict {
 }
 
 impl MergeConflict {
+    pub fn compute_conflict_id(
+        file_path: &str,
+        internal_path: &[String],
+        conflict_type: &str,
+        base_sha: Option<&str>,
+        a_sha: Option<&str>,
+        b_sha: Option<&str>,
+    ) -> String {
+        use sha2::{Sha256, Digest};
+        let mut h = Sha256::new();
+        let sub = serde_json::to_string(internal_path).unwrap_or_default();
+        let mut vers = vec![a_sha.unwrap_or("NONE"), b_sha.unwrap_or("NONE")];
+        vers.sort();
+        let raw = format!(
+            "{}::{}::{}::{}::{}::{}",
+            file_path,
+            sub,
+            conflict_type,
+            base_sha.unwrap_or("NONE"),
+            vers[0],
+            vers[1]
+        );
+        h.update(raw.as_bytes());
+        format!("{:x}", h.finalize())[..16].to_string()
+    }
+
     pub fn new(path: &str, conflict_type: &str, details: &str) -> Self {
+        let cid = Self::compute_conflict_id(path, &[], conflict_type, None, None, None);
         Self {
             path: path.to_string(),
             conflict_type: conflict_type.to_string(),
@@ -39,20 +66,14 @@ impl MergeConflict {
             b_sha: None,
             label_a: None,
             label_b: None,
-            conflict_id: Some(uuid::Uuid::new_v4().to_string()[..16].to_string()),
+            conflict_id: Some(cid),
             file_path: Some(path.to_string()),
             internal_path: Vec::new(),
         }
     }
 
     pub fn with_internal(file_path: &str, internal_path: Vec<String>, conflict_type: &str, details: &str) -> Self {
-        let sub = internal_path.join("::");
-        let conflict_id = {
-            use sha2::{Sha256, Digest};
-            let mut h = Sha256::new();
-            h.update(format!("{}::{}::{}", file_path, sub, conflict_type).as_bytes());
-            format!("{:x}", h.finalize())[..16].to_string()
-        };
+        let cid = Self::compute_conflict_id(file_path, &internal_path, conflict_type, None, None, None);
         Self {
             path: file_path.to_string(),
             conflict_type: conflict_type.to_string(),
@@ -62,10 +83,22 @@ impl MergeConflict {
             b_sha: None,
             label_a: None,
             label_b: None,
-            conflict_id: Some(conflict_id),
+            conflict_id: Some(cid),
             file_path: Some(file_path.to_string()),
             internal_path,
         }
+    }
+
+    pub fn recompute_id(&mut self) {
+        let fpath = self.file_path.as_deref().unwrap_or(&self.path);
+        self.conflict_id = Some(Self::compute_conflict_id(
+            fpath,
+            &self.internal_path,
+            &self.conflict_type,
+            self.base_sha.as_deref(),
+            self.a_sha.as_deref(),
+            self.b_sha.as_deref(),
+        ));
     }
 }
 
@@ -111,14 +144,46 @@ impl SemanticMerger {
         }
 
         // 5. Both changed differently
+        let base_sha = base_bytes.map(|b| {
+            use sha2::{Sha256, Digest};
+            let mut h = Sha256::new();
+            h.update(b);
+            format!("{:x}", h.finalize())
+        });
+        let a_sha = a_bytes.map(|b| {
+            use sha2::{Sha256, Digest};
+            let mut h = Sha256::new();
+            h.update(b);
+            format!("{:x}", h.finalize())
+        });
+        let b_sha = b_bytes.map(|b| {
+            use sha2::{Sha256, Digest};
+            let mut h = Sha256::new();
+            h.update(b);
+            format!("{:x}", h.finalize())
+        });
+
+        let attach_metadata = |conflicts: &mut Vec<MergeConflict>| {
+            for c in conflicts.iter_mut() {
+                c.base_sha = base_sha.clone();
+                c.a_sha = a_sha.clone();
+                c.b_sha = b_sha.clone();
+                c.label_a = Some(label_a.to_string());
+                c.label_b = Some(label_b.to_string());
+                c.recompute_id();
+            }
+        };
+
         // Modify / Delete conflicts
         if a_bytes.is_none() && b_bytes.is_some() {
             conflicts.push(MergeConflict::new(path, "modify_delete", "File deleted by A but modified by B"));
+            attach_metadata(&mut conflicts);
             return (b_bytes.map(|b| b.to_vec()), conflicts);
         }
 
         if b_bytes.is_none() && a_bytes.is_some() {
             conflicts.push(MergeConflict::new(path, "modify_delete", "File deleted by B but modified by A"));
+            attach_metadata(&mut conflicts);
             return (a_bytes.map(|b| b.to_vec()), conflicts);
         }
 
@@ -128,16 +193,25 @@ impl SemanticMerger {
         // Binary file check
         if is_binary(a) || is_binary(b) || base_bytes.map_or(false, is_binary) {
             conflicts.push(MergeConflict::new(path, "binary", "Binary file modified concurrently with different contents"));
+            attach_metadata(&mut conflicts);
             return (Some(b.to_vec()), conflicts);
         }
 
         let a_str = match std::str::from_utf8(a) {
             Ok(s) => s,
-            Err(_) => return (Some(b.to_vec()), conflicts),
+            Err(_) => {
+                conflicts.push(MergeConflict::new(path, "binary", "File not valid UTF-8"));
+                attach_metadata(&mut conflicts);
+                return (Some(b.to_vec()), conflicts);
+            }
         };
         let b_str = match std::str::from_utf8(b) {
             Ok(s) => s,
-            Err(_) => return (Some(b.to_vec()), conflicts),
+            Err(_) => {
+                conflicts.push(MergeConflict::new(path, "binary", "File not valid UTF-8"));
+                attach_metadata(&mut conflicts);
+                return (Some(b.to_vec()), conflicts);
+            }
         };
         let base_str = base_bytes.and_then(|b| std::str::from_utf8(b).ok()).unwrap_or("");
 
@@ -148,6 +222,7 @@ impl SemanticMerger {
                 let val_base_opt = serde_json::from_str::<serde_json::Value>(base_str).ok();
                 let (merged_val, json_conflicts) = Self::merge_json_recursive(val_base_opt.as_ref(), &val_a, &val_b, path, &[]);
                 conflicts.extend(json_conflicts);
+                attach_metadata(&mut conflicts);
                 if let Ok(mut json_bytes) = serde_json::to_vec_pretty(&merged_val) {
                     json_bytes.push(b'\n');
                     return (Some(json_bytes), conflicts);
@@ -158,6 +233,8 @@ impl SemanticMerger {
         // Textual 3-way merge
         let (merged_text, text_conflicts) = Self::merge_text_3way(base_str, a_str, b_str, path, label_a, label_b);
         conflicts.extend(text_conflicts);
+        attach_metadata(&mut conflicts);
+
         (Some(merged_text.into_bytes()), conflicts)
     }
 

@@ -32,13 +32,18 @@ class MergeConflict:
     file_path: Optional[str] = None
     internal_path: Optional[List[str]] = None
 
+    def compute_conflict_id(self) -> str:
+        fpath = self.file_path or self.path
+        sub = json.dumps(self.internal_path or [])
+        versions = sorted([self.a_sha or "NONE", self.b_sha or "NONE"])
+        raw = f"{fpath}::{sub}::{self.conflict_type}::{self.base_sha or 'NONE'}::{versions[0]}::{versions[1]}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
     def __post_init__(self):
         if not self.file_path:
             self.file_path = self.path
         if not self.conflict_id:
-            sub = "::".join(self.internal_path or [])
-            raw = f"{self.file_path}::{sub}::{self.conflict_type}::{self.base_sha}::{self.a_sha}::{self.b_sha}"
-            self.conflict_id = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+            self.conflict_id = self.compute_conflict_id()
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -191,6 +196,7 @@ class SemanticMerger:
                         jc.b_sha = b_sha
                         jc.label_a = label_a
                         jc.label_b = label_b
+                        jc.conflict_id = jc.compute_conflict_id()
                     conflicts.extend(json_conflicts)
                 merged_bytes = json.dumps(merged_obj, indent=2, sort_keys=True).encode("utf-8") + b"\n"
                 return merged_bytes, conflicts
@@ -207,6 +213,7 @@ class SemanticMerger:
                 tc.b_sha = b_sha
                 tc.label_a = label_a
                 tc.label_b = label_b
+                tc.conflict_id = tc.compute_conflict_id()
             conflicts.extend(text_conflicts)
 
         return merged_text.encode("utf-8"), conflicts

@@ -208,12 +208,11 @@ Mais detalhes em [docs/benchmarks.md](../benchmarks.md).
 
 ## 🧪 Suíte de Testes
 
-O projeto conta com mais de 30 cenários automatizados cobrindo sanitização de caminhos (symlinks, Windows reserved names), integridade de CAS, concorrência de staging com locks de sessão, integridade de reconciliação de revisões, ciclo de vida de conflitos, pré-validação trifásica e exportação contínua para Git:
+O projeto conta com 50 cenários de testes automatizados em Python e 13 testes nativos de integração em Rust cobrindo sanitização e contenção de caminhos no Windows, integridade de CAS, concorrência no staging, integridade de reconciliação linear, ciclo de vida e identidade de conflitos, matriz de exportação Git de 3 vias, pré-validação trifásica e recuperação automática de índices:
 
 ```bash
 # Executar todos os testes de regressão e integridade em Python:
-python tests/test_all_regressions.py -v
-python tests/test_revisions_export_integrity.py -v
+python -m unittest discover -s tests -v
 
 # Executar testes nativos em Rust:
 cd aggit-rs && cargo test

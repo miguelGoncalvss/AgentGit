@@ -210,9 +210,10 @@ impl AgGitEngine {
         let all_txs = self.journal.get_all_transactions()?;
 
         // Track pending conflicts by path
-        let mut conflicts_by_path: HashMap<String, MergeConflict> = HashMap::new();
+        let mut conflicts_by_path: HashMap<String, Vec<MergeConflict>> = HashMap::new();
         for c in checkpoint.pending_conflicts {
-            conflicts_by_path.insert(c.path.clone(), c);
+            let p = c.file_path.clone().unwrap_or_else(|| c.path.clone());
+            conflicts_by_path.entry(p).or_default().push(c);
         }
 
         let mut virtual_blobs: HashMap<String, Vec<u8>> = HashMap::new();
@@ -234,13 +235,43 @@ impl AgGitEngine {
                 let norm = sanitize_repo_path(&self.repo_dir, &path)
                     .unwrap_or_else(|_| path.clone());
 
-                let is_explicit_res = tx.metadata.as_object().map_or(false, |m| {
-                    m.get("resolved_conflict_path").and_then(|v| v.as_str()) == Some(&norm) ||
-                    m.get("resolution").and_then(|v| v.get("resolved_path")).and_then(|v| v.as_str()) == Some(&norm)
+                let explicit_resolution_meta = tx.metadata.as_object().and_then(|m| {
+                    if let Some(res) = m.get("resolution").and_then(|v| v.as_object()) {
+                        let path_match = res.get("resolved_path").and_then(|v| v.as_str()) == Some(&norm);
+                        if path_match {
+                            return Some(res);
+                        }
+                    }
+                    if m.get("resolved_conflict_path").and_then(|v| v.as_str()) == Some(&norm) {
+                        return Some(m);
+                    }
+                    None
                 });
 
-                if is_explicit_res {
-                    conflicts_by_path.remove(&norm);
+                if let Some(res_meta) = explicit_resolution_meta {
+                    let target_ids: Vec<String> = res_meta.get("target_conflict_ids")
+                        .or_else(|| res_meta.get("target_conflicts"))
+                        .and_then(|v| v.as_array())
+                        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                        .unwrap_or_default();
+
+                    if !target_ids.is_empty() {
+                        if let Some(existing) = conflicts_by_path.get_mut(&norm) {
+                            existing.retain(|c| {
+                                if let Some(ref cid) = c.conflict_id {
+                                    !target_ids.contains(cid)
+                                } else {
+                                    false
+                                }
+                            });
+                            if existing.is_empty() {
+                                conflicts_by_path.remove(&norm);
+                            }
+                        }
+                    } else {
+                        conflicts_by_path.remove(&norm);
+                    }
+
                     match change.action {
                         ChangeAction::Delete => {
                             tree.remove(&norm);
@@ -273,7 +304,8 @@ impl AgGitEngine {
 
                 if !step_conflicts.is_empty() {
                     for sc in step_conflicts {
-                        conflicts_by_path.insert(sc.path.clone(), sc);
+                        let p = sc.file_path.clone().unwrap_or_else(|| sc.path.clone());
+                        conflicts_by_path.entry(p).or_default().push(sc);
                     }
                 }
 
@@ -303,7 +335,10 @@ impl AgGitEngine {
             checkpoint.processed_tx_ids.push(tx.tx_id.clone());
         }
 
-        let all_conflicts: Vec<MergeConflict> = conflicts_by_path.values().cloned().collect();
+        let mut all_conflicts: Vec<MergeConflict> = Vec::new();
+        for list in conflicts_by_path.values() {
+            all_conflicts.extend(list.clone());
+        }
 
         if !dry_run {
             checkpoint.tree = tree.clone();
@@ -330,6 +365,7 @@ impl AgGitEngine {
         resolved_bytes: Option<Vec<u8>>,
         agent_id: &str,
         message: &str,
+        target_conflict_ids: Option<Vec<String>>,
     ) -> std::io::Result<Transaction> {
         let norm = sanitize_repo_path(&self.repo_dir, path)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
@@ -352,6 +388,10 @@ impl AgGitEngine {
         meta.insert("resolved_conflict_path".to_string(), serde_json::Value::String(norm.clone()));
         let mut res_map = serde_json::Map::new();
         res_map.insert("resolved_path".to_string(), serde_json::Value::String(norm.clone()));
+        if let Some(ref tids) = target_conflict_ids {
+            let arr: Vec<serde_json::Value> = tids.iter().map(|s| serde_json::Value::String(s.clone())).collect();
+            res_map.insert("target_conflict_ids".to_string(), serde_json::Value::Array(arr));
+        }
         meta.insert("resolution".to_string(), serde_json::Value::Object(res_map));
 
         let tx = self.journal.append_transaction_with_metadata(
@@ -474,9 +514,11 @@ impl AgGitEngine {
         // 1. Remove deleted files (propagate error)
         for old_path in prev_state.keys() {
             if !unified_files.contains_key(old_path) {
-                let full = self.repo_dir.join(old_path);
-                if full.exists() {
-                    fs::remove_file(&full)?;
+                if let Ok(safe_old) = sanitize_repo_path(&self.repo_dir, old_path) {
+                    let full = self.repo_dir.join(safe_old);
+                    if full.exists() {
+                        fs::remove_file(&full)?;
+                    }
                 }
             }
         }
@@ -486,7 +528,9 @@ impl AgGitEngine {
 
         // 2. Write modified or added files atomically
         for (rel_path, content) in &unified_files {
-            let full_path = self.repo_dir.join(rel_path);
+            let safe_rel = sanitize_repo_path(&self.repo_dir, rel_path)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+            let full_path = self.repo_dir.join(&safe_rel);
             let content_sha = {
                 use sha2::{Sha256, Digest};
                 let mut h = Sha256::new();

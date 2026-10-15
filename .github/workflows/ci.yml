@@ -10,6 +10,7 @@ jobs:
   test-matrix:
     name: Build & Test (${{ matrix.os }} - Py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -37,24 +38,24 @@ jobs:
           git config --global user.email "ci@aggit.local"
           git config --global init.defaultBranch main
 
-      - name: Run Python Core Regression Suite
+      - name: Run Python Complete Test Suite
+        timeout-minutes: 10
         run: |
-          python tests/test_all_regressions.py -v
-
-      - name: Run Python Integrity & Export Regression Suite
-        run: |
-          python tests/test_revisions_export_integrity.py -v
+          python -m unittest discover -s tests -v
 
       - name: Build Rust Engine (Locked)
         working-directory: ./aggit-rs
+        timeout-minutes: 10
         run: |
           cargo build --release --locked
 
       - name: Run Rust Integration Tests (Locked)
         working-directory: ./aggit-rs
+        timeout-minutes: 10
         run: |
           cargo test --verbose --locked
 
       - name: Run Multi-Agent Benchmark Smoke Test
+        timeout-minutes: 10
         run: |
           python benchmark.py
