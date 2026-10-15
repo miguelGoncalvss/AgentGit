@@ -154,7 +154,8 @@ fn test_rust_conflict_persists_and_resolves_explicitly() {
     assert_eq!(conflicts2.len(), 1);
 
     // Explicit resolution
-    let _ = engine.resolve_conflict("file.txt", Some(b"resolved content\n".to_vec()), "admin", "resolve").unwrap();
+    let target_id = conflicts2[0].conflict_id.clone().unwrap();
+    let _ = engine.resolve_conflict("file.txt", Some(b"resolved content\n".to_vec()), "admin", "resolve", Some(vec![target_id])).unwrap();
 
     // Call 3: conflict cleared, unified tree updated
     let (files3, conflicts3) = engine.reconcile_state(false).unwrap();
@@ -320,4 +321,54 @@ fn test_rust_local_deletion_preserved() {
     // keep.txt must REMAIN deleted!
     assert!(!keep_path.exists(), "Local deletion of untouched file must be preserved");
 }
+
+#[test]
+fn test_rust_conflict_lifecycle_and_third_agent_edit() {
+    let dir = tempdir().unwrap();
+    let engine = AgGitEngine::init(dir.path()).unwrap();
+
+    let mut f0 = HashMap::new();
+    f0.insert("config.json".to_string(), b"{\"a\": 1, \"b\": 1}".to_vec());
+    let tx0 = engine.commit("a0", None, "base config", Some(f0), None, None).unwrap();
+
+    // Agent 1 edits 'a' to 2
+    let mut f1 = HashMap::new();
+    f1.insert("config.json".to_string(), b"{\"a\": 2, \"b\": 1}".to_vec());
+    let _ = engine.commit("a1", None, "agent1 edits a", Some(f1), Some(tx0.tx_id.clone()), None).unwrap();
+
+    // Agent 2 edits 'a' to 3
+    let mut f2 = HashMap::new();
+    f2.insert("config.json".to_string(), b"{\"a\": 3, \"b\": 1}".to_vec());
+    let _ = engine.commit("a2", None, "agent2 edits a", Some(f2), Some(tx0.tx_id.clone()), None).unwrap();
+
+    // Reconcile reveals conflict on 'a'
+    let (_, conflicts) = engine.reconcile_state(false).unwrap();
+    assert_eq!(conflicts.len(), 1);
+    let conflict_id = conflicts[0].conflict_id.clone().unwrap();
+
+    // Agent 3 performs a normal commit on the same file without explicit resolution
+    let mut f3 = HashMap::new();
+    f3.insert("config.json".to_string(), b"{\"a\": 3, \"b\": 2}".to_vec());
+    let _ = engine.commit("a3", None, "agent3 normal edit on b", Some(f3), None, None).unwrap();
+
+    // Reconcile: conflict on 'a' must STILL be pending!
+    let (_, conflicts_after) = engine.reconcile_state(false).unwrap();
+    assert_eq!(conflicts_after.len(), 1, "Normal commit must not dismiss pending conflict on 'a'");
+    assert_eq!(conflicts_after[0].conflict_id.as_ref().unwrap(), &conflict_id);
+
+    // Explicit resolution of conflict_id
+    let _ = engine.resolve_conflict(
+        "config.json",
+        Some(b"{\"a\": 4, \"b\": 2}".to_vec()),
+        "admin",
+        "resolve a",
+        Some(vec![conflict_id]),
+    ).unwrap();
+
+    // Now conflict is cleared
+    let (files_final, conflicts_final) = engine.reconcile_state(false).unwrap();
+    assert_eq!(conflicts_final.len(), 0);
+    assert!(files_final.contains_key("config.json"));
+}
+
 

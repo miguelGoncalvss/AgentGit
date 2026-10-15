@@ -32,24 +32,54 @@ class Journal:
         os.makedirs(self.journal_dir, exist_ok=True)
         self._index: Optional[Dict[str, Any]] = None
         self._index_mtime: Optional[float] = None
+        self.read_only: bool = False
 
-    def _load_index(self) -> Dict[str, Any]:
+    def _load_index(self, read_only: bool = False) -> Dict[str, Any]:
         disk_mtime = os.path.getmtime(self.index_path) if os.path.exists(self.index_path) else None
+        index_data = None
         if self._index is not None and disk_mtime is not None and self._index_mtime == disk_mtime:
-            return self._index
-        if os.path.exists(self.index_path):
+            index_data = self._index
+        elif os.path.exists(self.index_path):
             try:
                 with open(self.index_path, "r", encoding="utf-8") as f:
-                    self._index = json.load(f)
+                    index_data = json.load(f)
                     self._index_mtime = disk_mtime
-                    return self._index
             except Exception:
-                pass
-        self._index = self._rebuild_index()
-        self._save_index(self._index)
+                index_data = None
+
+        # Check if index is missing or lagging behind physical journal events
+        tx_files = [f for f in os.listdir(self.journal_dir) if f.endswith(".json") and not f.startswith(".tmp_")]
+        is_behind = False
+        if index_data is None:
+            is_behind = True
+        else:
+            all_ids = index_data.get("all_tx_ids", [])
+            if len(tx_files) != len(all_ids):
+                is_behind = True
+            elif tx_files:
+                latest_file = sorted(tx_files)[-1]
+                by_id = index_data.get("by_id", {})
+                if not any(info.get("filename") == latest_file for info in by_id.values()):
+                    is_behind = True
+
+        if is_behind:
+            self._index = self._rebuild_index()
+            effective_read_only = read_only or self.read_only
+            if not effective_read_only:
+                try:
+                    self._save_index(self._index)
+                except Exception:
+                    pass
+            return self._index
+
+        self._index = index_data
         return self._index
 
     def _save_index(self, index: Dict[str, Any]):
+        if self.read_only:
+            self._index = index
+            return
+
         self._index = index
         tmp = self.index_path + f".tmp_{os.getpid()}_{uuid.uuid4().hex}.tmp"
         try:

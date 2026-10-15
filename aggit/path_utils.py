@@ -19,6 +19,21 @@ WINDOWS_RESERVED = {
     "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
 }
 
+def is_path_contained(target_path: str, base_dir: str) -> bool:
+    """
+    Checks whether target_path is strictly within or equal to base_dir,
+    accounting for symlinks, junctions, case-insensitivity on Windows,
+    and cross-drive paths.
+    """
+    try:
+        real_t = os.path.realpath(os.path.abspath(target_path))
+        real_b = os.path.realpath(os.path.abspath(base_dir))
+        norm_t = os.path.normcase(real_t)
+        norm_b = os.path.normcase(real_b)
+        return os.path.commonpath([norm_b, norm_t]) == norm_b
+    except (ValueError, OSError):
+        return False
+
 def sanitize_repo_path(repo_dir: str, rel_path: str) -> str:
     """
     Validates and normalizes a repository-relative path.
@@ -58,41 +73,24 @@ def sanitize_repo_path(repo_dir: str, rel_path: str) -> str:
         if base_stem in WINDOWS_RESERVED:
             raise PathSecurityError(f"Reserved Windows device name forbidden: '{part}' in '{rel_path}'")
 
-    # Double-check lexical resolved path stays within repo_dir
+    # Double-check lexical and canonical path stays within repo_dir
     abs_repo = os.path.abspath(repo_dir)
     target_abs = os.path.abspath(os.path.join(abs_repo, normalized))
 
-    try:
-        common = os.path.commonpath([abs_repo, target_abs])
-        if common != abs_repo:
-            raise PathSecurityError(f"Path resolves outside repository: '{rel_path}'")
-    except ValueError:
-        raise PathSecurityError(f"Path is on a different drive than repository: '{rel_path}'")
+    if not is_path_contained(target_abs, abs_repo):
+        raise PathSecurityError(f"Path resolves outside repository: '{rel_path}'")
 
-    # Check for symlink / junction escapes
-    real_repo = os.path.realpath(abs_repo)
-    if os.path.exists(target_abs) or os.path.islink(target_abs):
-        real_target = os.path.realpath(target_abs)
-        try:
-            if os.path.commonpath([real_repo, real_target]) != real_repo:
-                raise PathSecurityError(f"Path escapes repository via symlink: '{rel_path}' -> '{real_target}'")
-        except ValueError:
-            raise PathSecurityError(f"Symlink points to different drive: '{rel_path}'")
-    else:
-        # Check existing parent directories for symlink escape
-        curr = os.path.dirname(target_abs)
-        while curr and curr != abs_repo and os.path.commonpath([abs_repo, curr]) == abs_repo:
-            if os.path.exists(curr) or os.path.islink(curr):
-                real_parent = os.path.realpath(curr)
-                try:
-                    if os.path.commonpath([real_repo, real_parent]) != real_repo:
-                        raise PathSecurityError(f"Parent directory escapes repository via symlink: '{curr}' -> '{real_parent}'")
-                except ValueError:
-                    raise PathSecurityError(f"Parent symlink points to different drive: '{curr}'")
-                break
-            parent = os.path.dirname(curr)
-            if parent == curr:
-                break
-            curr = parent
+    # Check for intermediate symlink / junction escapes
+    curr = target_abs
+    base_norm = os.path.normcase(abs_repo)
+    while True:
+        if os.path.islink(curr):
+            real_parent = os.path.realpath(curr)
+            if not is_path_contained(real_parent, abs_repo):
+                raise PathSecurityError(f"Path escapes repository via symlink: '{curr}' -> '{real_parent}'")
+        parent = os.path.dirname(curr)
+        if parent == curr or os.path.normcase(os.path.abspath(curr)) == base_norm:
+            break
+        curr = parent
 
     return normalized

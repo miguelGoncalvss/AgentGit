@@ -159,36 +159,57 @@ class AgGitEngine:
                 except OSError:
                     pass
 
-    def get_revision_tree(self, target_tx_id: str) -> Dict[str, str]:
+    def get_revision_tree(self, target_tx_id: str, tx_map: Optional[Dict[str, TransactionRecord]] = None) -> Dict[str, str]:
         """Reconstructs the exact repository tree at target_tx_id by traversing ancestral graph."""
         if target_tx_id in self._revision_tree_cache:
             return dict(self._revision_tree_cache[target_tx_id])
 
         self.stats["trees_rebuilt"] += 1
-        all_txs = self.journal.get_all_transactions()
-        self.stats["events_read"] += len(all_txs)
-        tx_map = {t.tx_id: t for t in all_txs}
+        if tx_map is None:
+            all_txs = self.journal.get_all_transactions()
+            self.stats["events_read"] += len(all_txs)
+            tx_map = {t.tx_id: t for t in all_txs}
+
         if target_tx_id not in tx_map:
             raise ValueError(f"Revision {target_tx_id} not found in journal")
 
-        # Gather lineage from target back to root
+        target_tx = tx_map[target_tx_id]
+        parent_id = target_tx.parents[0] if target_tx.parents else None
+
+        # Fast-path: if parent tree is already cached, derive directly
+        if parent_id and parent_id in self._revision_tree_cache:
+            tree = dict(self._revision_tree_cache[parent_id])
+            for path, change in target_tx.changes.items():
+                if change.action == "delete":
+                    tree.pop(path, None)
+                elif change.blob_sha:
+                    tree[path] = change.blob_sha
+            self._revision_tree_cache[target_tx_id] = dict(tree)
+            return tree
+
+        # Gather lineage from target back to root or nearest cached ancestor
         lineage = []
         curr = target_tx_id
         visited = set()
+        base_tree: Dict[str, str] = {}
         while curr and curr in tx_map and curr not in visited:
+            if curr in self._revision_tree_cache:
+                base_tree = dict(self._revision_tree_cache[curr])
+                break
             visited.add(curr)
             lineage.append(tx_map[curr])
             parents = tx_map[curr].parents
             curr = parents[0] if parents else None
 
         lineage.reverse()
-        tree: Dict[str, str] = {}
+        tree = base_tree
         for tx in lineage:
             for path, change in tx.changes.items():
                 if change.action == "delete":
                     tree.pop(path, None)
                 elif change.blob_sha:
                     tree[path] = change.blob_sha
+            self._revision_tree_cache[tx.tx_id] = dict(tree)
 
         self._revision_tree_cache[target_tx_id] = dict(tree)
         return tree
@@ -214,7 +235,7 @@ class AgGitEngine:
 
         tree: Dict[str, str] = dict(checkpoint.get("tree", {}))
         processed_set = set(checkpoint.get("processed_tx_ids", []))
-        
+
         # Load any existing pending conflicts, indexed by file_path
         pending_conflicts_raw = checkpoint.get("pending_conflicts", [])
         conflicts_by_file: Dict[str, List[MergeConflict]] = {}
@@ -222,6 +243,21 @@ class AgGitEngine:
             conflict_obj = MergeConflict.from_dict(c)
             file_key = conflict_obj.file_path or conflict_obj.path
             conflicts_by_file.setdefault(file_key, []).append(conflict_obj)
+
+        latest_tx = self.journal.get_latest_transaction()
+        latest_tx_id = latest_tx.tx_id if latest_tx else None
+
+        # Short-circuit: if latest transaction is already processed, 0 new events to scan
+        if latest_tx_id and latest_tx_id in processed_set and not force_rebuild:
+            all_conflicts: List[MergeConflict] = []
+            for clist in conflicts_by_file.values():
+                all_conflicts.extend(clist)
+            unified_files: Dict[str, bytes] = {}
+            for p, sha in tree.items():
+                content = self.storage.get_blob(sha)
+                if content is not None:
+                    unified_files[p] = content
+            return unified_files, all_conflicts
 
         all_txs = self.journal.get_all_transactions()
         self.stats["events_read"] += len(all_txs)
@@ -277,16 +313,16 @@ class AgGitEngine:
                     target_p = tx.metadata["resolved_conflict_path"]
                     explicit_resolutions[target_p] = {"resolved_path": target_p}
 
-            # Determine base tree for this transaction
+            # Determine base tree for this transaction using passed tx_map
             base_tree = {}
             if tx.base_revision:
                 try:
-                    base_tree = self.get_revision_tree(tx.base_revision)
+                    base_tree = self.get_revision_tree(tx.base_revision, tx_map=tx_map)
                 except Exception:
                     base_tree = {}
             elif tx.parents:
                 try:
-                    base_tree = self.get_revision_tree(tx.parents[0])
+                    base_tree = self.get_revision_tree(tx.parents[0], tx_map=tx_map)
                 except Exception:
                     base_tree = {}
 
@@ -304,14 +340,14 @@ class AgGitEngine:
                 is_explicit_res = norm_path in explicit_resolutions
                 if is_explicit_res:
                     res_meta = explicit_resolutions[norm_path]
-                    target_conflicts = res_meta.get("target_conflicts")
+                    target_conflicts = set(res_meta.get("target_conflicts") or res_meta.get("target_conflict_ids") or [])
                     if target_conflicts and norm_path in conflicts_by_file:
                         conflicts_by_file[norm_path] = [
                             c for c in conflicts_by_file[norm_path] if c.conflict_id not in target_conflicts
                         ]
                         if not conflicts_by_file[norm_path]:
                             conflicts_by_file.pop(norm_path, None)
-                    else:
+                    elif not target_conflicts and norm_path in conflicts_by_file:
                         conflicts_by_file.pop(norm_path, None)
 
                     if change.action == "delete" or tx_sha is None:
@@ -364,24 +400,36 @@ class AgGitEngine:
         path: str,
         resolved_bytes: Optional[bytes] = None,
         agent_id: str = "resolver",
-        message: Optional[str] = None
+        message: Optional[str] = None,
+        target_conflict_ids: Optional[List[str]] = None
     ) -> TransactionRecord:
         """
         Explicitly resolves a pending conflict on a path.
         Appends a resolution transaction to the journal and updates checkpoint.
         If resolved_bytes is None, resolves by deletion.
+        If target_conflict_ids is provided, resolves only those specific conflict identities.
         """
         norm_path = sanitize_repo_path(self.repo_dir, path)
-        try:
-            checkpoint = self._load_latest_checkpoint()
-        except IncompatibleCheckpointError:
-            checkpoint = {}
-        pending = checkpoint.get("pending_conflicts", [])
-        matching = [
-            c for c in pending
-            if c.get("file_path") == norm_path or c.get("path") == norm_path
-        ]
-        target_ids = [c.get("conflict_id") for c in matching if c.get("conflict_id")]
+        if target_conflict_ids is not None:
+            target_ids = list(target_conflict_ids)
+            resolved_versions = [{"conflict_id": cid} for cid in target_ids]
+        else:
+            _, current_conflicts = self.reconcile_state(dry_run=True)
+            matching = [
+                c for c in current_conflicts
+                if c.file_path == norm_path or c.path == norm_path
+            ]
+            target_ids = [c.conflict_id for c in matching if c.conflict_id]
+            resolved_versions = [
+                {
+                    "conflict_id": c.conflict_id,
+                    "base_sha": c.base_sha,
+                    "a_sha": c.a_sha,
+                    "b_sha": c.b_sha,
+                    "conflict_type": c.conflict_type
+                }
+                for c in matching
+            ]
 
         action = "delete" if resolved_bytes is None else "modify"
         blob_sha = self.storage.store_blob(resolved_bytes) if resolved_bytes is not None else None
@@ -400,6 +448,8 @@ class AgGitEngine:
                 "resolution": {
                     "resolved_path": norm_path,
                     "target_conflicts": target_ids,
+                    "target_conflict_ids": target_ids,
+                    "resolved_versions": resolved_versions,
                     "resolved_tx_ids": parents
                 },
                 "resolved_conflict_path": norm_path
