@@ -25,6 +25,10 @@ from .semantic_merge import SemanticMerger, MergeConflict
 from .schema import TransactionRecord, ChangeRecord
 from .path_utils import sanitize_repo_path
 
+class IncompatibleCheckpointError(Exception):
+    """Raised when a checkpoint is missing required fields or has incompatible legacy schema."""
+    pass
+
 class AgGitEngine:
     def __init__(self, repo_dir: str):
         self.repo_dir = os.path.abspath(repo_dir)
@@ -82,29 +86,27 @@ class AgGitEngine:
         Otherwise uses current staged changes for this session.
         Preserves base_revision and accurate parents.
         """
-        staged_state = self.staging.get_staged_state(agent_id, session_id)
-        current_generation = staged_state.get("generation", 0)
-
-        effective_base = base_revision or staged_state.get("base_revision")
-        effective_parents = parents
-        if effective_parents is None:
-            # If base_revision was specified, it's the parent; else lookup current HEAD
-            if effective_base:
-                effective_parents = [effective_base]
-            else:
-                latest = self.journal.get_latest_transaction()
-                effective_parents = [latest.tx_id] if latest else []
-
         changes: Dict[str, ChangeRecord] = {}
+        snapshot_generation = 0
         if files is not None:
             for p, content in files.items():
                 norm = sanitize_repo_path(self.repo_dir, p)
                 sha = self.storage.store_blob(content)
                 changes[norm] = ChangeRecord(action="modify", blob_sha=sha)
+            effective_base = base_revision
         else:
-            changes = self.staging.get_staged_changes(agent_id, session_id)
+            changes, snapshot_generation, staged_base = self.staging.get_staged_snapshot(agent_id, session_id)
             if not changes:
                 raise ValueError(f"Nothing to commit for agent '{agent_id}' (staging is empty)")
+            effective_base = base_revision or staged_base
+
+        effective_parents = parents
+        if effective_parents is None:
+            if effective_base:
+                effective_parents = [effective_base]
+            else:
+                latest = self.journal.get_latest_transaction()
+                effective_parents = [latest.tx_id] if latest else []
 
         tx = self.journal.append_transaction(
             agent_id=agent_id,
@@ -117,7 +119,7 @@ class AgGitEngine:
         )
 
         if files is None:
-            self.staging.clear(agent_id, session_id, max_generation=current_generation)
+            self.staging.consume_committed_changes(agent_id, session_id, changes, snapshot_generation)
 
         return tx
 
@@ -127,11 +129,15 @@ class AgGitEngine:
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    data.setdefault("pending_conflicts", [])
-                    return data
-            except Exception:
-                pass
+                if data.get("version", 1) < 2 or "pending_conflicts" not in data:
+                    raise IncompatibleCheckpointError("Legacy checkpoint missing pending_conflicts; full journal rebuild required")
+                return data
+            except IncompatibleCheckpointError:
+                raise
+            except Exception as e:
+                raise IncompatibleCheckpointError(f"Corrupt checkpoint file: {e}")
         return {"version": 2, "tree": {}, "processed_tx_ids": [], "pending_conflicts": []}
+
 
     def _save_checkpoint(self, tree: Dict[str, str], processed_tx_ids: List[str], pending_conflicts: List[Dict[str, Any]]):
         data = {
@@ -198,16 +204,24 @@ class AgGitEngine:
         dry_run=True computes plan and conflicts in-memory WITHOUT mutating checkpoint on disk.
         Pending conflicts persist across calls and restarts until explicitly resolved.
         """
-        checkpoint = {} if force_rebuild else self._load_latest_checkpoint()
+        if force_rebuild:
+            checkpoint = {}
+        else:
+            try:
+                checkpoint = self._load_latest_checkpoint()
+            except IncompatibleCheckpointError:
+                checkpoint = {}
+
         tree: Dict[str, str] = dict(checkpoint.get("tree", {}))
         processed_set = set(checkpoint.get("processed_tx_ids", []))
         
-        # Load any existing pending conflicts
+        # Load any existing pending conflicts, indexed by file_path
         pending_conflicts_raw = checkpoint.get("pending_conflicts", [])
-        conflicts_by_path: Dict[str, MergeConflict] = {}
+        conflicts_by_file: Dict[str, List[MergeConflict]] = {}
         for c in pending_conflicts_raw:
             conflict_obj = MergeConflict.from_dict(c)
-            conflicts_by_path[conflict_obj.path] = conflict_obj
+            file_key = conflict_obj.file_path or conflict_obj.path
+            conflicts_by_file.setdefault(file_key, []).append(conflict_obj)
 
         all_txs = self.journal.get_all_transactions()
         self.stats["events_read"] += len(all_txs)
@@ -231,7 +245,38 @@ class AgGitEngine:
 
         new_txs = [t for t in ordered_txs if t.tx_id not in processed_set]
 
+        virtual_blobs: Dict[str, bytes] = {}
+
+        def get_blob(sha: Optional[str]) -> Optional[bytes]:
+            if not sha:
+                return None
+            if sha in virtual_blobs:
+                return virtual_blobs[sha]
+            self.stats["blobs_read"] += 1
+            return self.storage.get_blob(sha)
+
+        def put_blob(content: bytes) -> str:
+            if dry_run:
+                header = f"blob {len(content)}\0".encode("utf-8")
+                blob_sha = hashlib.sha256(header + content).hexdigest()
+                virtual_blobs[blob_sha] = content
+                return blob_sha
+            else:
+                return self.storage.store_blob(content)
+
         for tx in new_txs:
+            # Check if transaction declares explicit resolutions
+            explicit_resolutions: Dict[str, Any] = {}
+            if tx.metadata and isinstance(tx.metadata, dict):
+                if "resolution" in tx.metadata and isinstance(tx.metadata["resolution"], dict):
+                    res = tx.metadata["resolution"]
+                    target_p = res.get("resolved_path")
+                    if target_p:
+                        explicit_resolutions[target_p] = res
+                elif "resolved_conflict_path" in tx.metadata:
+                    target_p = tx.metadata["resolved_conflict_path"]
+                    explicit_resolutions[target_p] = {"resolved_path": target_p}
+
             # Determine base tree for this transaction
             base_tree = {}
             if tx.base_revision:
@@ -252,20 +297,23 @@ class AgGitEngine:
                 curr_sha = tree.get(norm_path)
                 tx_sha = change.blob_sha
 
-                base_bytes = self.storage.get_blob(base_sha) if base_sha else None
-                curr_bytes = self.storage.get_blob(curr_sha) if curr_sha else None
-                tx_bytes = self.storage.get_blob(tx_sha) if tx_sha else None
+                base_bytes = get_blob(base_sha)
+                curr_bytes = get_blob(curr_sha)
+                tx_bytes = get_blob(tx_sha)
 
-                if base_sha:
-                    self.stats["blobs_read"] += 1
-                if curr_sha:
-                    self.stats["blobs_read"] += 1
-                if tx_sha:
-                    self.stats["blobs_read"] += 1
+                is_explicit_res = norm_path in explicit_resolutions
+                if is_explicit_res:
+                    res_meta = explicit_resolutions[norm_path]
+                    target_conflicts = res_meta.get("target_conflicts")
+                    if target_conflicts and norm_path in conflicts_by_file:
+                        conflicts_by_file[norm_path] = [
+                            c for c in conflicts_by_file[norm_path] if c.conflict_id not in target_conflicts
+                        ]
+                        if not conflicts_by_file[norm_path]:
+                            conflicts_by_file.pop(norm_path, None)
+                    else:
+                        conflicts_by_file.pop(norm_path, None)
 
-                if norm_path in conflicts_by_path:
-                    # Transaction provides an explicit resolution for this conflicted path
-                    conflicts_by_path.pop(norm_path, None)
                     if change.action == "delete" or tx_sha is None:
                         tree.pop(norm_path, None)
                     else:
@@ -282,22 +330,20 @@ class AgGitEngine:
                 )
 
                 if step_conflicts:
-                    for sc in step_conflicts:
-                        conflicts_by_path[sc.path] = sc
-                else:
-                    # Clean merge or resolution clears prior pending conflict on this path
-                    conflicts_by_path.pop(norm_path, None)
+                    conflicts_by_file.setdefault(norm_path, []).extend(step_conflicts)
 
                 if merged_bytes is None:
                     # Cleanly deleted
                     tree.pop(norm_path, None)
                 else:
-                    new_sha = self.storage.store_blob(merged_bytes)
+                    new_sha = put_blob(merged_bytes)
                     tree[norm_path] = new_sha
 
             processed_set.add(tx.tx_id)
 
-        all_conflicts = list(conflicts_by_path.values())
+        all_conflicts: List[MergeConflict] = []
+        for clist in conflicts_by_file.values():
+            all_conflicts.extend(clist)
 
         # Save incremental checkpoint ONLY if not a dry run
         if not dry_run:
@@ -307,8 +353,9 @@ class AgGitEngine:
         # Materialize in-memory bytes map
         unified_files: Dict[str, bytes] = {}
         for p, sha in tree.items():
-            self.stats["blobs_read"] += 1
-            unified_files[p] = self.storage.get_blob(sha)
+            content = get_blob(sha)
+            if content is not None:
+                unified_files[p] = content
 
         return unified_files, all_conflicts
 
@@ -325,9 +372,16 @@ class AgGitEngine:
         If resolved_bytes is None, resolves by deletion.
         """
         norm_path = sanitize_repo_path(self.repo_dir, path)
-        checkpoint = self._load_latest_checkpoint()
+        try:
+            checkpoint = self._load_latest_checkpoint()
+        except IncompatibleCheckpointError:
+            checkpoint = {}
         pending = checkpoint.get("pending_conflicts", [])
-        matching = [c for c in pending if c.get("path") == norm_path]
+        matching = [
+            c for c in pending
+            if c.get("file_path") == norm_path or c.get("path") == norm_path
+        ]
+        target_ids = [c.get("conflict_id") for c in matching if c.get("conflict_id")]
 
         action = "delete" if resolved_bytes is None else "modify"
         blob_sha = self.storage.store_blob(resolved_bytes) if resolved_bytes is not None else None
@@ -342,7 +396,14 @@ class AgGitEngine:
             message=tx_msg,
             changes=changes,
             parents=parents,
-            metadata={"resolved_conflict_path": norm_path}
+            metadata={
+                "resolution": {
+                    "resolved_path": norm_path,
+                    "target_conflicts": target_ids,
+                    "resolved_tx_ids": parents
+                },
+                "resolved_conflict_path": norm_path
+            }
         )
 
         # Run reconcile to update checkpoint and clear the conflict
@@ -356,8 +417,10 @@ class AgGitEngine:
         - Validates the ENTIRE plan before touching any file on disk.
         - Detects local edits, local deletions, and untracked files occupying target path.
         - Blocks if unresolved conflicts are pending on relevant paths.
+        - Preserves local deletions when agents haven't touched the file.
         - Idempotent: writes 0 files if content on disk already matches desired.
         - Publishes files atomically via temp write and replacement.
+        - Propagates all deletion and persistence errors.
         """
         unified_files, conflicts = self.reconcile_state(dry_run=False)
 
@@ -380,6 +443,7 @@ class AgGitEngine:
         # -------------------------------------------------------------
         all_paths = set(unified_files.keys()) | set(prev_state.keys())
         blocked_errors: List[str] = []
+        preserved_local_deletions: Set[str] = set()
 
         for p in all_paths:
             norm_p = sanitize_repo_path(self.repo_dir, p)
@@ -409,7 +473,7 @@ class AgGitEngine:
                         blocked_errors.append(f"Local modification would be deleted: '{norm_p}' was edited locally")
                 continue
 
-            # Case C: File is scheduled for write
+            # Case C: File is scheduled for write / exists in desired unified state
             if desired_sha is not None:
                 if disk_exists:
                     if prev_sha is None and not force:
@@ -418,8 +482,13 @@ class AgGitEngine:
                         if disk_sha != prev_sha and not force:
                             blocked_errors.append(f"Local modification would be overwritten: '{norm_p}' was edited locally")
                 else:
-                    if prev_sha is not None and prev_sha != desired_sha and not force:
-                        blocked_errors.append(f"Local deletion conflict: '{norm_p}' was deleted locally but agent updated it")
+                    # File does NOT exist on disk
+                    if prev_sha is not None:
+                        if prev_sha == desired_sha:
+                            # User deleted it locally, and no agent updated it in AgGit -> PRESERVE local deletion!
+                            preserved_local_deletions.add(norm_p)
+                        elif not force:
+                            blocked_errors.append(f"Local deletion conflict: '{norm_p}' was deleted locally but agent updated it")
 
         if blocked_errors:
             raise RuntimeError("Materialization aborted to preserve local work:\n  " + "\n  ".join(blocked_errors))
@@ -430,15 +499,12 @@ class AgGitEngine:
         written_count = 0
         new_state: Dict[str, str] = {}
 
-        # 1. Remove deleted files
+        # 1. Remove deleted files (propagate errors)
         for old_path in prev_state.keys():
             if old_path not in unified_files:
                 full = os.path.join(self.repo_dir, old_path)
                 if os.path.exists(full):
-                    try:
-                        os.remove(full)
-                    except OSError:
-                        pass
+                    os.remove(full)
 
         # 2. Write modified or added files atomically
         for rel_path, content in unified_files.items():
@@ -446,6 +512,10 @@ class AgGitEngine:
             full_path = os.path.join(self.repo_dir, norm_path)
             content_sha = hashlib.sha256(content).hexdigest()
             new_state[norm_path] = content_sha
+
+            # If user deleted locally and agents haven't touched it, preserve local deletion!
+            if norm_path in preserved_local_deletions and not force:
+                continue
 
             # Skip write if already identical on disk
             if os.path.exists(full_path):
@@ -473,13 +543,15 @@ class AgGitEngine:
                         pass
                 raise
 
-        # Save updated materialized state
+        # Save updated materialized state (propagate errors)
         tmp_meta = self.materialized_state_path + f".tmp_{os.getpid()}_{uuid.uuid4().hex}.tmp"
         try:
             with open(tmp_meta, "w", encoding="utf-8") as f:
                 json.dump(new_state, f, indent=2, sort_keys=True)
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp_meta, self.materialized_state_path)
-        except Exception:
+        finally:
             if os.path.exists(tmp_meta):
                 try:
                     os.remove(tmp_meta)

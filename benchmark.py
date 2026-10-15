@@ -26,18 +26,21 @@ import subprocess
 from concurrent.futures import ProcessPoolExecutor
 from typing import Dict, Any, List, Tuple
 
-# Safe cleanup helper for Windows read-only files
+# Safe cleanup helper for Windows read-only files across Python 3.11 and 3.12+
 def safe_rmtree(path: str):
     if not os.path.exists(path):
         return
-    def _onerror(func, p, excinfo):
+    def _handle_remove_readonly(func, p, excinfo):
         try:
             import stat
             os.chmod(p, stat.S_IWRITE)
             func(p)
         except Exception:
             pass
-    shutil.rmtree(path, onexc=_onerror)
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_handle_remove_readonly)
+    else:
+        shutil.rmtree(path, onerror=_handle_remove_readonly)
 
 # --- 1. Git Shared Index Worker ---
 def _git_shared_worker(args: Tuple[str, int]) -> Dict[str, Any]:
@@ -259,12 +262,16 @@ class BenchmarkRunner:
             os.path.abspath(os.path.join("aggit-rs", "target", "release", "aggit.exe")),
             os.path.abspath(os.path.join("aggit-rs", "target", "release", "aggit")),
             os.path.abspath("aggit.exe"),
-            os.path.abspath("aggit"),
         ]
+        if sys.platform != "win32":
+            candidates.append(os.path.abspath("aggit_bin"))
+
+        def is_valid_executable(p: str) -> bool:
+            return os.path.isfile(p) and os.access(p, os.X_OK if sys.platform != "win32" else os.R_OK)
 
         exe_path = None
         for cand in candidates:
-            if os.path.exists(cand):
+            if is_valid_executable(cand):
                 exe_path = cand
                 break
 
@@ -272,9 +279,12 @@ class BenchmarkRunner:
             # Build release binary from source
             subprocess.run(["cargo", "build", "--release", "--manifest-path", "aggit-rs/Cargo.toml"], check=True)
             for cand in candidates:
-                if os.path.exists(cand):
+                if is_valid_executable(cand):
                     exe_path = cand
                     break
+
+        if not exe_path:
+            raise FileNotFoundError("Could not find or build native AgGit Rust executable")
 
         proc = subprocess.run(
             [exe_path, "benchmark", "--agents", str(self.num_agents), "--json"],

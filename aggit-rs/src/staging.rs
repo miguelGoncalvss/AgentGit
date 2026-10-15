@@ -52,6 +52,11 @@ impl StagingArea {
         self.staging_dir.join(self.agent_staging_filename(agent_id, session_id))
     }
 
+    fn agent_lock_path(&self, agent_id: &str, session_id: Option<&str>) -> PathBuf {
+        let p = self.agent_staging_path(agent_id, session_id);
+        PathBuf::from(format!("{}.lock", p.display()))
+    }
+
     pub fn get_staged_doc(&self, agent_id: &str, session_id: Option<&str>) -> StagingDoc {
         let p = self.agent_staging_path(agent_id, session_id);
         if !p.exists() {
@@ -102,6 +107,8 @@ impl StagingArea {
     }
 
     pub fn set_base_revision(&self, agent_id: &str, session_id: Option<&str>, base_revision: &str) -> std::io::Result<()> {
+        let lock_path = self.agent_lock_path(agent_id, session_id);
+        let _lock = crate::lock_utils::FileLock::acquire(&lock_path, std::time::Duration::from_secs(10))?;
         let mut doc = self.get_staged_doc(agent_id, session_id);
         doc.base_revision = Some(base_revision.to_string());
         doc.generation += 1;
@@ -131,11 +138,8 @@ impl StagingArea {
         files_to_delete: Option<Vec<String>>,
         base_revision: Option<String>,
     ) -> std::io::Result<HashMap<String, ChangeRecord>> {
-        let mut doc = self.get_staged_doc(agent_id, session_id);
-        if let Some(base) = base_revision {
-            doc.base_revision = Some(base);
-        }
-
+        // Pre-compute blob hashes outside lock to keep critical section short
+        let mut prepared_blobs = HashMap::new();
         if let Some(files) = files_to_stage {
             for (rel_path, content_opt) in files {
                 let norm_path = sanitize_repo_path(&self.repo_dir, &rel_path)
@@ -150,15 +154,26 @@ impl StagingArea {
                 };
 
                 let blob_sha = storage.store_blob(&bytes)?;
-                let old_sha = doc.entries.get(&norm_path).and_then(|c| c.blob_sha.clone());
-                let action = if old_sha.is_none() { ChangeAction::Add } else { ChangeAction::Modify };
-
-                doc.entries.insert(norm_path, ChangeRecord {
-                    action,
-                    blob_sha: Some(blob_sha),
-                    old_sha,
-                });
+                prepared_blobs.insert(norm_path, blob_sha);
             }
+        }
+
+        let lock_path = self.agent_lock_path(agent_id, session_id);
+        let _lock = crate::lock_utils::FileLock::acquire(&lock_path, std::time::Duration::from_secs(10))?;
+
+        let mut doc = self.get_staged_doc(agent_id, session_id);
+        if let Some(base) = base_revision {
+            doc.base_revision = Some(base);
+        }
+
+        for (norm_path, blob_sha) in prepared_blobs {
+            let old_sha = doc.entries.get(&norm_path).and_then(|c| c.blob_sha.clone());
+            let action = if old_sha.is_none() { ChangeAction::Add } else { ChangeAction::Modify };
+            doc.entries.insert(norm_path, ChangeRecord {
+                action,
+                blob_sha: Some(blob_sha),
+                old_sha,
+            });
         }
 
         if let Some(deletions) = files_to_delete {
@@ -201,7 +216,51 @@ impl StagingArea {
         Ok(())
     }
 
+    pub fn consume_committed_changes(
+        &self,
+        agent_id: &str,
+        session_id: Option<&str>,
+        committed_entries: &HashMap<String, ChangeRecord>,
+        snapshot_generation: u64,
+    ) {
+        let path = self.agent_staging_path(agent_id, session_id);
+        if !path.exists() {
+            return;
+        }
+
+        let lock_path = self.agent_lock_path(agent_id, session_id);
+        let _lock = match crate::lock_utils::FileLock::acquire(&lock_path, std::time::Duration::from_secs(10)) {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+
+        let mut doc = self.get_staged_doc(agent_id, session_id);
+        if doc.generation <= snapshot_generation {
+            let _ = fs::remove_file(&path);
+            return;
+        }
+
+        for (p, committed_rec) in committed_entries {
+            if let Some(curr_entry) = doc.entries.get(p) {
+                if curr_entry.action == committed_rec.action && curr_entry.blob_sha == committed_rec.blob_sha {
+                    doc.entries.remove(p);
+                }
+            }
+        }
+
+        if doc.entries.is_empty() {
+            let _ = fs::remove_file(&path);
+        } else {
+            let _ = self.write_staging_doc(agent_id, session_id, &doc);
+        }
+    }
+
     pub fn clear_if_generation_le(&self, agent_id: &str, session_id: Option<&str>, max_generation: u64) {
+        let lock_path = self.agent_lock_path(agent_id, session_id);
+        let _lock = match crate::lock_utils::FileLock::acquire(&lock_path, std::time::Duration::from_secs(10)) {
+            Ok(l) => l,
+            Err(_) => return,
+        };
         let doc = self.get_staged_doc(agent_id, session_id);
         if doc.generation <= max_generation {
             let path = self.agent_staging_path(agent_id, session_id);
@@ -212,9 +271,12 @@ impl StagingArea {
     }
 
     pub fn clear(&self, agent_id: &str) {
+        let lock_path = self.agent_lock_path(agent_id, None);
+        let _lock = crate::lock_utils::FileLock::acquire(&lock_path, std::time::Duration::from_secs(10)).ok();
         let path = self.agent_staging_path(agent_id, None);
         if path.exists() {
             let _ = fs::remove_file(path);
         }
     }
+
 }

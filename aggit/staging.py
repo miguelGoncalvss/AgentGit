@@ -164,6 +164,78 @@ class StagingArea:
     def stage_delete(self, agent_id: str, rel_path: str, session_id: Optional[str] = None):
         self.stage_batch(agent_id, files_to_delete=[rel_path], session_id=session_id)
 
+    def get_staged_snapshot(self, agent_id: str, session_id: Optional[str] = None) -> Tuple[Dict[str, ChangeRecord], int, Optional[str]]:
+        """
+        Takes an atomic snapshot of currently staged entries under session lock.
+        Returns (changes_map, generation, base_revision).
+        """
+        lock_file = self._agent_lock_path(agent_id, session_id)
+        with file_lock(lock_file):
+            state = self.get_staged_state(agent_id, session_id)
+            entries = state.get("entries", {})
+            gen = state.get("generation", 0)
+            base_rev = state.get("base_revision")
+            changes = {p: ChangeRecord.from_dict(v) for p, v in entries.items()}
+            return changes, gen, base_rev
+
+    def consume_committed_changes(
+        self,
+        agent_id: str,
+        session_id: Optional[str],
+        committed_changes: Dict[str, ChangeRecord],
+        snapshot_generation: int
+    ):
+        """
+        Removes the committed changes from staging under lock.
+        If concurrent stages occurred, only entries that were not modified/added since the snapshot
+        are removed. Newer files or updated blobs are strictly preserved.
+        """
+        path = self._agent_staging_path(agent_id, session_id)
+        if not os.path.exists(path):
+            return
+
+        lock_file = self._agent_lock_path(agent_id, session_id)
+        with file_lock(lock_file):
+            state = self.get_staged_state(agent_id, session_id)
+            entries = state.get("entries", {})
+            curr_gen = state.get("generation", 0)
+
+            # If generation did not change, everything can be cleared
+            if curr_gen <= snapshot_generation:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                return
+
+            # Concurrent changes occurred! Remove only paths that were committed and unchanged
+            for p, committed_rec in committed_changes.items():
+                if p in entries:
+                    curr_entry = entries[p]
+                    if curr_entry.get("action") == committed_rec.action and curr_entry.get("blob_sha") == committed_rec.blob_sha:
+                        entries.pop(p, None)
+
+            if not entries:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                return
+
+            state["entries"] = entries
+            tmp = path + f".tmp_{os.getpid()}_{threading.get_ident()}_{uuid.uuid4().hex}.tmp"
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(state, f, indent=2, sort_keys=True)
+                os.replace(tmp, path)
+            except Exception:
+                if os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+                raise
+
     def clear(self, agent_id: str, session_id: Optional[str] = None, max_generation: Optional[int] = None):
         """
         Clears the staging area only if current generation <= max_generation.
@@ -187,3 +259,4 @@ class StagingArea:
                 os.remove(path)
             except OSError:
                 pass
+

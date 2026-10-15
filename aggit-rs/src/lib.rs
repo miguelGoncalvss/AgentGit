@@ -5,3 +5,5 @@ pub mod semantic;
 pub mod schema;
 pub mod path_utils;
 pub mod engine;
+pub mod lock_utils;
+

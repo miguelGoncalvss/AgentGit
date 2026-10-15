@@ -17,12 +17,13 @@ import re
 import json
 import uuid
 import shutil
+import hashlib
 import tempfile
 import subprocess
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
 from .engine import AgGitEngine
-from .semantic_merge import MergeConflict
+from .semantic_merge import SemanticMerger, MergeConflict
 from .schema import ChangeRecord
 
 @dataclass
@@ -34,6 +35,7 @@ class ExportPlan:
     files_to_delete: List[str]
     conflicts: List[MergeConflict]
     is_clean: bool
+    current_aggit_tree: Dict[str, str] = field(default_factory=dict)
 
 @dataclass
 class ExportResult:
@@ -80,6 +82,45 @@ class GitBridge:
             raise ValueError(f"Invalid branch name syntax: '{clean}'")
         return clean
 
+    @staticmethod
+    def _validate_safe_path(base_dir: str, rel_path: str) -> str:
+        norm = os.path.normpath(rel_path).replace("\\", "/")
+        if norm.startswith("../") or norm == ".." or os.path.isabs(norm):
+            raise ValueError(f"Directory traversal detected: '{rel_path}'")
+        
+        full = os.path.abspath(os.path.join(base_dir, norm))
+        real_base = os.path.realpath(base_dir)
+        
+        cur = os.path.dirname(full)
+        while cur and cur != real_base:
+            if os.path.islink(cur):
+                target = os.path.realpath(cur)
+                if not target.startswith(real_base):
+                    raise ValueError(f"Symlink traversal detected: '{rel_path}' points outside worktree")
+            cur = os.path.dirname(cur)
+
+        if os.path.islink(full):
+            target = os.path.realpath(full)
+            if not target.startswith(real_base):
+                raise ValueError(f"Symlink traversal detected: '{rel_path}' points outside worktree")
+
+        if not full.startswith(real_base):
+            raise ValueError(f"Path escapes worktree: '{rel_path}'")
+
+        return full
+
+    @staticmethod
+    def _get_git_file_bytes(repo_dir: str, commit_or_branch: str, rel_path: str) -> Optional[bytes]:
+        norm = rel_path.replace("\\", "/")
+        proc = subprocess.run(
+            ["git", "cat-file", "-p", f"{commit_or_branch}:{norm}"],
+            cwd=repo_dir,
+            capture_output=True
+        )
+        if proc.returncode == 0:
+            return proc.stdout
+        return None
+
     def prepare_export_plan(
         self,
         target_revision: Optional[str] = None,
@@ -88,39 +129,97 @@ class GitBridge:
     ) -> ExportPlan:
         """
         Reconciles AgGit state in-memory WITHOUT modifying the working directory or checkpoints.
-        Identifies exact additions, modifications, deletions, and any conflicts.
+        Identifies exact delimited additions, modifications, deletions, and any conflicts.
+        Preserves external changes made to untouched files on the destination branch.
         """
         valid_branch = self.validate_branch_name(branch_name)
         if target_revision:
             tree_map = self.engine.get_revision_tree(target_revision)
-            files_to_write = {p: self.engine.storage.get_blob(sha) for p, sha in tree_map.items()}
+            unified_files = {p: self.engine.storage.get_blob(sha) for p, sha in tree_map.items()}
             conflicts: List[MergeConflict] = []
             rev_id = target_revision
         else:
-            files_to_write, conflicts = self.engine.reconcile_state(dry_run=True)
+            unified_files, conflicts = self.engine.reconcile_state(dry_run=True)
             latest = self.engine.journal.get_latest_transaction()
             rev_id = latest.tx_id if latest else "genesis"
 
-        # Check files to delete against base branch ONLY if explicitly deleted in AgGit
-        files_to_delete: List[str] = []
-        git_dir = os.path.join(self.repo_dir, ".git")
-        if os.path.exists(git_dir):
-            cmd = ["git", "ls-tree", "-r", "--name-only", base_branch]
-            proc = subprocess.run(cmd, cwd=self.repo_dir, capture_output=True, text=True, encoding="utf-8")
-            if proc.returncode == 0:
-                base_files = set(proc.stdout.splitlines())
-                # Find paths explicitly marked deleted in AgGit history
-                deleted_in_aggit = set()
-                for tx in self.engine.journal.get_all_transactions():
-                    for p, ch in tx.changes.items():
-                        if ch.action == "delete":
-                            deleted_in_aggit.add(p)
-                        elif p in deleted_in_aggit:
-                            deleted_in_aggit.remove(p)
+        current_aggit_tree = {
+            p: hashlib.sha256(content).hexdigest()
+            for p, content in unified_files.items()
+        }
 
-                for del_path in deleted_in_aggit:
-                    if del_path in base_files and del_path not in files_to_write:
-                        files_to_delete.append(del_path)
+        mapping = self._load_export_map()
+        branch_state = mapping.get("branches", {}).get(valid_branch)
+
+        files_to_write: Dict[str, bytes] = {}
+        files_to_delete: List[str] = []
+
+        if branch_state and "last_aggit_tree" in branch_state:
+            last_aggit_tree = branch_state["last_aggit_tree"]
+            last_git_commit = branch_state.get("last_git_commit")
+
+            # 1. AgGit added: in current but not in last
+            for p, cur_hash in current_aggit_tree.items():
+                if p not in last_aggit_tree:
+                    files_to_write[p] = unified_files[p]
+
+            # 2. AgGit deleted: in last but not in current
+            for p in last_aggit_tree:
+                if p not in current_aggit_tree:
+                    files_to_delete.append(p)
+
+            # 3. AgGit modified: in both with different content hashes
+            for p, cur_hash in current_aggit_tree.items():
+                if p in last_aggit_tree and last_aggit_tree[p] != cur_hash:
+                    aggit_bytes = unified_files[p]
+                    if last_git_commit:
+                        base_git_bytes = self._get_git_file_bytes(self.repo_dir, last_git_commit, p)
+                        cur_git_bytes = self._get_git_file_bytes(self.repo_dir, valid_branch, p)
+                        if cur_git_bytes is not None and base_git_bytes is not None and cur_git_bytes != base_git_bytes:
+                            # Both modified: 3-way merge
+                            merged_bytes, step_conflicts = SemanticMerger.merge_files(
+                                path=p,
+                                base_bytes=base_git_bytes,
+                                a_bytes=cur_git_bytes,
+                                b_bytes=aggit_bytes,
+                                label_a=f"git_{valid_branch}",
+                                label_b="aggit"
+                            )
+                            if step_conflicts:
+                                conflicts.extend(step_conflicts)
+                            elif merged_bytes is not None:
+                                files_to_write[p] = merged_bytes
+                            continue
+
+                    files_to_write[p] = aggit_bytes
+
+        else:
+            # First export to valid_branch: write all current AgGit files
+            files_to_write = dict(unified_files)
+            
+            # Check if any files from base_branch were deleted in AgGit
+            git_dir = os.path.join(self.repo_dir, ".git")
+            if os.path.exists(git_dir):
+                proc = subprocess.run(
+                    ["git", "ls-tree", "-r", "--name-only", base_branch],
+                    cwd=self.repo_dir,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8"
+                )
+                if proc.returncode == 0:
+                    base_files = set(proc.stdout.splitlines())
+                    deleted_in_aggit = set()
+                    for tx in self.engine.journal.get_all_transactions():
+                        for p, ch in tx.changes.items():
+                            if ch.action == "delete":
+                                deleted_in_aggit.add(p)
+                            elif p in deleted_in_aggit:
+                                deleted_in_aggit.remove(p)
+
+                    for del_path in deleted_in_aggit:
+                        if del_path in base_files and del_path not in unified_files:
+                            files_to_delete.append(del_path)
 
         return ExportPlan(
             revision_tx_id=rev_id,
@@ -129,7 +228,8 @@ class GitBridge:
             files_to_write=files_to_write,
             files_to_delete=files_to_delete,
             conflicts=conflicts,
-            is_clean=len(conflicts) == 0
+            is_clean=len(conflicts) == 0,
+            current_aggit_tree=current_aggit_tree
         )
 
     def preview_export(
@@ -226,6 +326,15 @@ class GitBridge:
                     details=existing
                 )
 
+        # Early return if no delta to write or delete
+        if len(plan.files_to_write) == 0 and len(plan.files_to_delete) == 0:
+            return ExportResult(
+                status="no_changes",
+                branch_name=valid_branch,
+                git_commit_hash=current_branch_tip,
+                message="No delta between target revision and last export. Working tree already in sync."
+            )
+
         # 3. Create isolated worktree for the target branch
         temp_worktree = tempfile.mkdtemp(prefix="aggit_worktree_")
         try:
@@ -246,17 +355,23 @@ class GitBridge:
                 if wt_proc.returncode != 0:
                     raise RuntimeError(f"Failed to checkout Git worktree on existing branch: {wt_proc.stderr.strip()}")
 
-            # 4. Apply deletions
+            # 4. Apply deletions safely
             for del_path in plan.files_to_delete:
-                full_del = os.path.join(temp_worktree, del_path)
+                full_del = self._validate_safe_path(temp_worktree, del_path)
                 if os.path.exists(full_del):
-                    os.remove(full_del)
-                    subprocess.run(["git", "rm", "-f", "--ignore-unmatch", "--", del_path], cwd=temp_worktree, capture_output=True)
+                    if os.path.isdir(full_del):
+                        shutil.rmtree(full_del, ignore_errors=True)
+                    else:
+                        try:
+                            os.remove(full_del)
+                        except OSError:
+                            pass
+                subprocess.run(["git", "rm", "-f", "--ignore-unmatch", "--", del_path], cwd=temp_worktree, capture_output=True)
 
-            # 5. Apply additions and modifications
+            # 5. Apply additions and modifications safely
             staged_paths: List[str] = []
             for rel_path, content in plan.files_to_write.items():
-                target_file = os.path.join(temp_worktree, rel_path)
+                target_file = self._validate_safe_path(temp_worktree, rel_path)
                 os.makedirs(os.path.dirname(target_file), exist_ok=True)
                 with open(target_file, "wb") as f:
                     f.write(content)
@@ -268,6 +383,18 @@ class GitBridge:
                 for i in range(0, len(staged_paths), chunk_size):
                     chunk = staged_paths[i:i + chunk_size]
                     subprocess.run(["git", "add", "--"] + chunk, cwd=temp_worktree, check=True, capture_output=True)
+
+            # Check for concurrent modification on destination branch before committing (CAS)
+            if branch_exists:
+                tip_check = subprocess.run(
+                    ["git", "rev-parse", "--verify", f"refs/heads/{valid_branch}"],
+                    cwd=self.repo_dir,
+                    capture_output=True,
+                    text=True
+                )
+                current_tip_now = tip_check.stdout.strip() if tip_check.returncode == 0 else ""
+                if current_tip_now != current_branch_tip:
+                    raise RuntimeError(f"Concurrent modification detected on '{valid_branch}': branch tip moved during export")
 
             # 6. Create Git commit
             msg = commit_message or f"chore(aggit): exported revision {plan.revision_tx_id[:8]} to {valid_branch}"
@@ -292,7 +419,14 @@ class GitBridge:
 
             rev_hash = subprocess.run(["git", "rev-parse", "HEAD"], cwd=temp_worktree, capture_output=True, text=True).stdout.strip()
 
-            # Record in idempotent export mapping ledger
+            # Record in idempotent export mapping ledger and update branch tracking
+            mapping = self._load_export_map()
+            branches_map = mapping.setdefault("branches", {})
+            branches_map[valid_branch] = {
+                "last_aggit_tree": plan.current_aggit_tree,
+                "last_git_commit": rev_hash,
+                "last_aggit_revision": plan.revision_tx_id
+            }
             mapping[ledger_key] = {
                 "revision_tx_id": plan.revision_tx_id,
                 "branch_name": valid_branch,

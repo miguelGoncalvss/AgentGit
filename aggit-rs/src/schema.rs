@@ -119,6 +119,20 @@ impl Transaction {
         }
     }
 
+    pub fn new_with_metadata(
+        agent_id: &str,
+        session_id: Option<&str>,
+        message: &str,
+        changes: HashMap<String, ChangeRecord>,
+        parents: Vec<String>,
+        base_revision: Option<String>,
+        metadata: serde_json::Value,
+    ) -> Self {
+        let mut tx = Self::new(agent_id, session_id, message, changes, parents, base_revision);
+        tx.metadata = metadata;
+        tx
+    }
+
     /// Normalizes transaction so that changes map is guaranteed populated even for legacy v1 records
     pub fn get_effective_changes(&self) -> HashMap<String, ChangeRecord> {
         if !self.changes.is_empty() {

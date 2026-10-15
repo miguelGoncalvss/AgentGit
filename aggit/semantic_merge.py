@@ -29,16 +29,23 @@ class MergeConflict:
     label_a: Optional[str] = None
     label_b: Optional[str] = None
     conflict_id: Optional[str] = None
+    file_path: Optional[str] = None
+    internal_path: Optional[List[str]] = None
 
     def __post_init__(self):
+        if not self.file_path:
+            self.file_path = self.path
         if not self.conflict_id:
-            raw = f"{self.path}::{self.conflict_type}::{self.base_sha}::{self.a_sha}::{self.b_sha}"
+            sub = "::".join(self.internal_path or [])
+            raw = f"{self.file_path}::{sub}::{self.conflict_type}::{self.base_sha}::{self.a_sha}::{self.b_sha}"
             self.conflict_id = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "conflict_id": self.conflict_id,
             "path": self.path,
+            "file_path": self.file_path,
+            "internal_path": self.internal_path or [],
             "conflict_type": self.conflict_type,
             "details": self.details,
             "base_sha": self.base_sha,
@@ -50,8 +57,9 @@ class MergeConflict:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "MergeConflict":
+        fpath = d.get("file_path") or d.get("path", "")
         return cls(
-            path=d.get("path", ""),
+            path=fpath,
             conflict_type=d.get("conflict_type", "unknown"),
             details=d.get("details", ""),
             base_sha=d.get("base_sha"),
@@ -59,8 +67,11 @@ class MergeConflict:
             b_sha=d.get("b_sha"),
             label_a=d.get("label_a"),
             label_b=d.get("label_b"),
-            conflict_id=d.get("conflict_id")
+            conflict_id=d.get("conflict_id"),
+            file_path=fpath,
+            internal_path=d.get("internal_path", [])
         )
+
 
 def is_binary_bytes(data: bytes) -> bool:
     """Checks if data contains null bytes or fails UTF-8 decoding."""
@@ -72,7 +83,10 @@ def is_binary_bytes(data: bytes) -> bool:
     except UnicodeDecodeError:
         return True
 
+_ABSENT = object()
+ 
 class SemanticMerger:
+
     @staticmethod
     def merge_files(
         path: str,
@@ -199,18 +213,26 @@ class SemanticMerger:
 
     @staticmethod
     def merge_json_recursive(
+
         base_val: Any,
         a_val: Any,
         b_val: Any,
-        path: str
+        file_path: str,
+        internal_path: Optional[List[str]] = None
     ) -> Tuple[Any, List[MergeConflict]]:
         """
-        Recursively merges JSON data.
-        Correctly preserves independent additions (e.g. {"porta": 3000} and {"debug": true}).
-        Reports conflicts in conflict list without corrupting values.
+        Recursively merges JSON data with strict distinction between:
+        - absent key (_ABSENT)
+        - null value (None)
+        - empty object ({})
+        - empty list ([])
+        - false/0
+        Preserves independent additions and handles keys with dots safely.
         """
         conflicts: List[MergeConflict] = []
+        cur_internal = internal_path or []
 
+        # If values are identical
         if a_val == b_val:
             return a_val, []
         if a_val == base_val:
@@ -218,58 +240,99 @@ class SemanticMerger:
         if b_val == base_val:
             return a_val, []
 
-        # If all three are dictionaries, perform recursive key merge
-        if isinstance(base_val, dict) and isinstance(a_val, dict) and isinstance(b_val, dict):
+        # If both A and B are dicts
+        if isinstance(a_val, dict) and isinstance(b_val, dict):
+            base_dict = base_val if isinstance(base_val, dict) else {}
             merged: Dict[str, Any] = {}
-            all_keys = set(base_val.keys()) | set(a_val.keys()) | set(b_val.keys())
+            all_keys = set(base_dict.keys()) | set(a_val.keys()) | set(b_val.keys())
 
             for k in sorted(all_keys):
-                in_base = k in base_val
-                in_a = k in a_val
-                in_b = k in b_val
+                in_base = base_dict.get(k, _ABSENT)
+                in_a = a_val.get(k, _ABSENT)
+                in_b = b_val.get(k, _ABSENT)
+                sub_path = cur_internal + [k]
 
-                if in_a and not in_b:
-                    if in_base:
-                        if base_val[k] == a_val[k]:
+                # Case 1: Present in A, absent in B
+                if in_a is not _ABSENT and in_b is _ABSENT:
+                    if in_base is not _ABSENT:
+                        if in_base == in_a:
                             # Untouched in A, deleted in B
                             pass
                         else:
                             # Modified in A, deleted in B -> Conflict
-                            conflicts.append(MergeConflict(path=f"{path}.{k}", conflict_type="json_key", details="Key modified in A but deleted in B"))
-                            merged[k] = a_val[k]
+                            conflicts.append(MergeConflict(
+                                path=file_path,
+                                file_path=file_path,
+                                internal_path=sub_path,
+                                conflict_type="json_key",
+                                details=f"Key '{'/'.join(sub_path)}' modified in A but deleted in B"
+                            ))
+                            merged[k] = in_a
                     else:
                         # Added in A only
-                        merged[k] = a_val[k]
+                        merged[k] = in_a
 
-                elif in_b and not in_a:
-                    if in_base:
-                        if base_val[k] == b_val[k]:
+                # Case 2: Present in B, absent in A
+                elif in_b is not _ABSENT and in_a is _ABSENT:
+                    if in_base is not _ABSENT:
+                        if in_base == in_b:
                             # Untouched in B, deleted in A
                             pass
                         else:
                             # Modified in B, deleted in A -> Conflict
-                            conflicts.append(MergeConflict(path=f"{path}.{k}", conflict_type="json_key", details="Key modified in B but deleted in A"))
-                            merged[k] = b_val[k]
+                            conflicts.append(MergeConflict(
+                                path=file_path,
+                                file_path=file_path,
+                                internal_path=sub_path,
+                                conflict_type="json_key",
+                                details=f"Key '{'/'.join(sub_path)}' modified in B but deleted in A"
+                            ))
+                            merged[k] = in_b
                     else:
                         # Added in B only
-                        merged[k] = b_val[k]
+                        merged[k] = in_b
 
-                elif in_a and in_b:
-                    v_base = base_val.get(k)
-                    sub_val, sub_conflicts = SemanticMerger.merge_json_recursive(v_base, a_val[k], b_val[k], f"{path}.{k}")
-                    merged[k] = sub_val
-                    conflicts.extend(sub_conflicts)
+                # Case 3: Present in both A and B
+                elif in_a is not _ABSENT and in_b is not _ABSENT:
+                    if in_a == in_b:
+                        merged[k] = in_a
+                    elif in_base is not _ABSENT and in_a == in_base:
+                        # Untouched in A, changed in B
+                        merged[k] = in_b
+                    elif in_base is not _ABSENT and in_b == in_base:
+                        # Untouched in B, changed in A
+                        merged[k] = in_a
+                    elif isinstance(in_a, dict) and isinstance(in_b, dict):
+                        # Both modified/added dicts -> recurse
+                        sub_base = in_base if isinstance(in_base, dict) else _ABSENT
+                        sub_val, sub_conflicts = SemanticMerger.merge_json_recursive(
+                            sub_base, in_a, in_b, file_path, sub_path
+                        )
+                        merged[k] = sub_val
+                        conflicts.extend(sub_conflicts)
+                    else:
+                        # Differing scalar/array/null values
+                        conflicts.append(MergeConflict(
+                            path=file_path,
+                            file_path=file_path,
+                            internal_path=sub_path,
+                            conflict_type="json_key",
+                            details=f"Conflicting value update at '{'/'.join(sub_path)}': A has {in_a!r}, B has {in_b!r}"
+                        ))
+                        merged[k] = in_b
 
             return merged, conflicts
 
-        # For non-dict scalar/array values with different edits: Conflict!
+        # Differing values for non-dict
         conflicts.append(MergeConflict(
-            path=path,
+            path=file_path,
+            file_path=file_path,
+            internal_path=cur_internal,
             conflict_type="json_key",
-            details=f"Conflicting value update: A has '{a_val}', B has '{b_val}'"
+            details=f"Conflicting value update at '{'/'.join(cur_internal)}': A has {a_val!r}, B has {b_val!r}"
         ))
-        # Keep B by convention when conflict occurs, but conflict is logged
         return b_val, conflicts
+
 
     @staticmethod
     def merge_text_3way(

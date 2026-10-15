@@ -22,6 +22,10 @@ pub struct MergeConflict {
     pub label_b: Option<String>,
     #[serde(default)]
     pub conflict_id: Option<String>,
+    #[serde(default)]
+    pub file_path: Option<String>,
+    #[serde(default)]
+    pub internal_path: Vec<String>,
 }
 
 impl MergeConflict {
@@ -36,6 +40,31 @@ impl MergeConflict {
             label_a: None,
             label_b: None,
             conflict_id: Some(uuid::Uuid::new_v4().to_string()[..16].to_string()),
+            file_path: Some(path.to_string()),
+            internal_path: Vec::new(),
+        }
+    }
+
+    pub fn with_internal(file_path: &str, internal_path: Vec<String>, conflict_type: &str, details: &str) -> Self {
+        let sub = internal_path.join("::");
+        let conflict_id = {
+            use sha2::{Sha256, Digest};
+            let mut h = Sha256::new();
+            h.update(format!("{}::{}::{}", file_path, sub, conflict_type).as_bytes());
+            format!("{:x}", h.finalize())[..16].to_string()
+        };
+        Self {
+            path: file_path.to_string(),
+            conflict_type: conflict_type.to_string(),
+            details: details.to_string(),
+            base_sha: None,
+            a_sha: None,
+            b_sha: None,
+            label_a: None,
+            label_b: None,
+            conflict_id: Some(conflict_id),
+            file_path: Some(file_path.to_string()),
+            internal_path,
         }
     }
 }
@@ -116,8 +145,8 @@ impl SemanticMerger {
 
         if ext == "json" {
             if let (Ok(val_a), Ok(val_b)) = (serde_json::from_str::<serde_json::Value>(a_str), serde_json::from_str::<serde_json::Value>(b_str)) {
-                let val_base = serde_json::from_str::<serde_json::Value>(base_str).unwrap_or(serde_json::Value::Object(Default::default()));
-                let (merged_val, json_conflicts) = Self::merge_json_recursive(&val_base, &val_a, &val_b, path);
+                let val_base_opt = serde_json::from_str::<serde_json::Value>(base_str).ok();
+                let (merged_val, json_conflicts) = Self::merge_json_recursive(val_base_opt.as_ref(), &val_a, &val_b, path, &[]);
                 conflicts.extend(json_conflicts);
                 if let Ok(mut json_bytes) = serde_json::to_vec_pretty(&merged_val) {
                     json_bytes.push(b'\n');
@@ -133,31 +162,40 @@ impl SemanticMerger {
     }
 
     pub fn merge_json_recursive(
-        base_val: &serde_json::Value,
+        base_val: Option<&serde_json::Value>,
         a_val: &serde_json::Value,
         b_val: &serde_json::Value,
-        path: &str,
+        file_path: &str,
+        internal_path: &[String],
     ) -> (serde_json::Value, Vec<MergeConflict>) {
         let mut conflicts = Vec::new();
 
         if a_val == b_val {
             return (a_val.clone(), conflicts);
         }
-        if a_val == base_val {
+        if base_val == Some(a_val) {
             return (b_val.clone(), conflicts);
         }
-        if b_val == base_val {
+        if base_val == Some(b_val) {
             return (a_val.clone(), conflicts);
         }
 
-        if let (Some(map_base), Some(map_a), Some(map_b)) = (base_val.as_object(), a_val.as_object(), b_val.as_object()) {
+        if let (Some(map_a), Some(map_b)) = (a_val.as_object(), b_val.as_object()) {
+            let map_base_opt = base_val.and_then(|v| v.as_object());
             let mut merged = serde_json::Map::new();
-            let all_keys: BTreeSet<String> = map_base.keys().chain(map_a.keys()).chain(map_b.keys()).cloned().collect();
+            let mut all_keys: BTreeSet<String> = BTreeSet::new();
+            if let Some(mb) = map_base_opt {
+                all_keys.extend(mb.keys().cloned());
+            }
+            all_keys.extend(map_a.keys().cloned());
+            all_keys.extend(map_b.keys().cloned());
 
             for k in all_keys {
-                let in_base = map_base.get(&k);
+                let in_base = map_base_opt.and_then(|m| m.get(&k));
                 let in_a = map_a.get(&k);
                 let in_b = map_b.get(&k);
+                let mut sub_internal = internal_path.to_vec();
+                sub_internal.push(k.clone());
 
                 match (in_a, in_b) {
                     (Some(va), None) => {
@@ -166,10 +204,11 @@ impl SemanticMerger {
                                 // Untouched in A, deleted in B
                             } else {
                                 // Modified in A, deleted in B -> Conflict
-                                conflicts.push(MergeConflict::new(
-                                    &format!("{}.{}", path, k),
+                                conflicts.push(MergeConflict::with_internal(
+                                    file_path,
+                                    sub_internal,
                                     "json_key",
-                                    "Key modified in A but deleted in B",
+                                    &format!("Key '{}' modified in A but deleted in B", k),
                                 ));
                                 merged.insert(k, va.clone());
                             }
@@ -184,10 +223,11 @@ impl SemanticMerger {
                                 // Untouched in B, deleted in A
                             } else {
                                 // Modified in B, deleted in A -> Conflict
-                                conflicts.push(MergeConflict::new(
-                                    &format!("{}.{}", path, k),
+                                conflicts.push(MergeConflict::with_internal(
+                                    file_path,
+                                    sub_internal,
                                     "json_key",
-                                    "Key modified in B but deleted in A",
+                                    &format!("Key '{}' modified in B but deleted in A", k),
                                 ));
                                 merged.insert(k, vb.clone());
                             }
@@ -197,9 +237,7 @@ impl SemanticMerger {
                         }
                     }
                     (Some(va), Some(vb)) => {
-                        let empty_obj = serde_json::Value::Object(Default::default());
-                        let vbase = in_base.unwrap_or(&empty_obj);
-                        let (sub_val, sub_conflicts) = Self::merge_json_recursive(vbase, va, vb, &format!("{}.{}", path, k));
+                        let (sub_val, sub_conflicts) = Self::merge_json_recursive(in_base, va, vb, file_path, &sub_internal);
                         conflicts.extend(sub_conflicts);
                         merged.insert(k, sub_val);
                     }
@@ -211,10 +249,16 @@ impl SemanticMerger {
         }
 
         // Conflict on scalar / non-matching types
-        conflicts.push(MergeConflict::new(
-            path,
+        let key_display = if internal_path.is_empty() {
+            file_path.to_string()
+        } else {
+            internal_path.join("/")
+        };
+        conflicts.push(MergeConflict::with_internal(
+            file_path,
+            internal_path.to_vec(),
             "json_key",
-            &format!("Conflicting value updates in JSON at {}", path),
+            &format!("Conflicting value updates in JSON at {}", key_display),
         ));
         (b_val.clone(), conflicts)
     }

@@ -65,7 +65,4 @@ def file_lock(lock_path: str, timeout_sec: float = 10.0, retry_interval: float =
                 os.close(lock_fd)
             except OSError:
                 pass
-            try:
-                os.remove(lock_path)
-            except OSError:
-                pass
+

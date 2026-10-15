@@ -89,6 +89,7 @@ impl AgGitEngine {
             }
         };
 
+        let is_direct = direct_files.is_some();
         let changes = if let Some(files) = direct_files {
             let mut map = HashMap::new();
             for (p, bytes) in files {
@@ -114,15 +115,18 @@ impl AgGitEngine {
             agent_id,
             session_id,
             message,
-            changes,
+            changes.clone(),
             effective_parents,
             effective_base,
         )?;
 
-        // Conditional clear: only wipe if no newer edits occurred
-        self.staging.clear_if_generation_le(agent_id, session_id, current_generation);
+        if !is_direct {
+            self.staging.consume_committed_changes(agent_id, session_id, &changes, current_generation);
+        }
         Ok(tx)
     }
+
+
 
     fn load_checkpoint(&self) -> Checkpoint {
         let path = self.checkpoint_dir.join("latest.json");
@@ -211,6 +215,8 @@ impl AgGitEngine {
             conflicts_by_path.insert(c.path.clone(), c);
         }
 
+        let mut virtual_blobs: HashMap<String, Vec<u8>> = HashMap::new();
+
         for tx in &all_txs {
             if processed_set.contains(&tx.tx_id) {
                 continue;
@@ -228,8 +234,12 @@ impl AgGitEngine {
                 let norm = sanitize_repo_path(&self.repo_dir, &path)
                     .unwrap_or_else(|_| path.clone());
 
-                if conflicts_by_path.contains_key(&norm) {
-                    // This transaction provides explicit resolution for this conflicted path
+                let is_explicit_res = tx.metadata.as_object().map_or(false, |m| {
+                    m.get("resolved_conflict_path").and_then(|v| v.as_str()) == Some(&norm) ||
+                    m.get("resolution").and_then(|v| v.get("resolved_path")).and_then(|v| v.as_str()) == Some(&norm)
+                });
+
+                if is_explicit_res {
                     conflicts_by_path.remove(&norm);
                     match change.action {
                         ChangeAction::Delete => {
@@ -248,9 +258,9 @@ impl AgGitEngine {
                 let curr_sha = tree.get(&norm);
                 let tx_sha = change.blob_sha.as_ref();
 
-                let base_bytes = base_sha.and_then(|s| self.storage.get_blob(s).ok());
-                let curr_bytes = curr_sha.and_then(|s| self.storage.get_blob(s).ok());
-                let tx_bytes = tx_sha.and_then(|s| self.storage.get_blob(s).ok());
+                let base_bytes = base_sha.and_then(|s| virtual_blobs.get(s).cloned().or_else(|| self.storage.get_blob(s).ok()));
+                let curr_bytes = curr_sha.and_then(|s| virtual_blobs.get(s).cloned().or_else(|| self.storage.get_blob(s).ok()));
+                let tx_bytes = tx_sha.and_then(|s| virtual_blobs.get(s).cloned().or_else(|| self.storage.get_blob(s).ok()));
 
                 let (merged_bytes_opt, step_conflicts) = SemanticMerger::merge_files(
                     &norm,
@@ -265,15 +275,23 @@ impl AgGitEngine {
                     for sc in step_conflicts {
                         conflicts_by_path.insert(sc.path.clone(), sc);
                     }
-                } else {
-                    conflicts_by_path.remove(&norm);
                 }
 
                 match merged_bytes_opt {
                     Some(merged_bytes) => {
-                        if let Ok(new_sha) = self.storage.store_blob(&merged_bytes) {
-                            tree.insert(norm, new_sha);
-                        }
+                        let new_sha = if dry_run {
+                            use sha2::{Sha256, Digest};
+                            let mut h = Sha256::new();
+                            h.update(format!("blob {}\0", merged_bytes.len()).as_bytes());
+                            h.update(&merged_bytes);
+                            let s = format!("{:x}", h.finalize());
+                            virtual_blobs.insert(s.clone(), merged_bytes);
+                            s
+                        } else {
+                            self.storage.store_blob(&merged_bytes)
+                                .map_err(|e| format!("Failed to store blob: {}", e))?
+                        };
+                        tree.insert(norm, new_sha);
                     }
                     None => {
                         tree.remove(&norm);
@@ -295,7 +313,9 @@ impl AgGitEngine {
 
         let mut unified_files = HashMap::new();
         for (p, sha) in tree {
-            if let Ok(bytes) = self.storage.get_blob(&sha) {
+            let content_opt = virtual_blobs.get(&sha).cloned()
+                .or_else(|| self.storage.get_blob(&sha).ok());
+            if let Some(bytes) = content_opt {
                 unified_files.insert(p, bytes);
             }
         }
@@ -318,17 +338,23 @@ impl AgGitEngine {
         match resolved_bytes {
             Some(bytes) => {
                 let sha = self.storage.store_blob(&bytes)?;
-                changes.insert(norm, ChangeRecord::modify(sha, None));
+                changes.insert(norm.clone(), ChangeRecord::modify(sha, None));
             }
             None => {
-                changes.insert(norm, ChangeRecord::delete(None));
+                changes.insert(norm.clone(), ChangeRecord::delete(None));
             }
         }
 
         let latest = self.journal.get_latest_transaction();
         let parents = latest.map(|t| vec![t.tx_id]).unwrap_or_default();
 
-        let tx = self.journal.append_transaction(
+        let mut meta = serde_json::Map::new();
+        meta.insert("resolved_conflict_path".to_string(), serde_json::Value::String(norm.clone()));
+        let mut res_map = serde_json::Map::new();
+        res_map.insert("resolved_path".to_string(), serde_json::Value::String(norm.clone()));
+        meta.insert("resolution".to_string(), serde_json::Value::Object(res_map));
+
+        let tx = self.journal.append_transaction_with_metadata(
             &self.storage,
             agent_id,
             None,
@@ -336,6 +362,7 @@ impl AgGitEngine {
             changes,
             parents,
             None,
+            serde_json::Value::Object(meta),
         )?;
 
         let _ = self.reconcile_state(false);
@@ -374,6 +401,8 @@ impl AgGitEngine {
         for k in prev_state.keys() {
             all_paths.insert(k.clone());
         }
+
+        let mut preserved_local_deletions = HashSet::new();
 
         for p in &all_paths {
             let full_path = self.repo_dir.join(p);
@@ -422,6 +451,19 @@ impl AgGitEngine {
                             format!("Local modification would be overwritten: '{}'", p),
                         ));
                     }
+                } else {
+                    // File does not exist on disk
+                    if let Some(prev) = prev_sha {
+                        if Some(prev) == desired_sha.as_ref() {
+                            // User deleted it locally and no agent modified it -> PRESERVE local deletion!
+                            preserved_local_deletions.insert(p.clone());
+                        } else if !force {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("Local deletion conflict: '{}' was deleted locally but agent updated it", p),
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -429,12 +471,12 @@ impl AgGitEngine {
         // -------------------------------------------------------------
         // PHASE 2: Safe atomic execution
         // -------------------------------------------------------------
-        // 1. Remove deleted files
+        // 1. Remove deleted files (propagate error)
         for old_path in prev_state.keys() {
             if !unified_files.contains_key(old_path) {
                 let full = self.repo_dir.join(old_path);
                 if full.exists() {
-                    let _ = fs::remove_file(full);
+                    fs::remove_file(&full)?;
                 }
             }
         }
@@ -445,10 +487,19 @@ impl AgGitEngine {
         // 2. Write modified or added files atomically
         for (rel_path, content) in &unified_files {
             let full_path = self.repo_dir.join(rel_path);
-            let sha = self.storage.store_blob(content)?;
-            new_state.insert(rel_path.clone(), sha.clone());
+            let content_sha = {
+                use sha2::{Sha256, Digest};
+                let mut h = Sha256::new();
+                h.update(content);
+                format!("{:x}", h.finalize())
+            };
+            new_state.insert(rel_path.clone(), content_sha.clone());
 
-            if prev_state.get(rel_path) == Some(&sha) && full_path.exists() {
+            if preserved_local_deletions.contains(rel_path) && !force {
+                continue;
+            }
+
+            if prev_state.get(rel_path) == Some(&content_sha) && full_path.exists() {
                 continue;
             }
 
@@ -462,19 +513,19 @@ impl AgGitEngine {
                 f.write_all(content)?;
                 f.sync_all()?;
             }
-            fs::rename(tmp_path, &full_path)?;
+            fs::rename(&tmp_path, &full_path)?;
             written_count += 1;
         }
 
-        // Save updated state
-        let tmp_meta = self.materialized_state_path.with_extension(format!("tmp_{}", uuid::Uuid::new_v4()));
+        // Save updated state (propagate error)
+        let tmp_meta = self.materialized_state_path.with_extension(format!("tmp_{}_{}.tmp", std::process::id(), uuid::Uuid::new_v4()));
         let meta_bytes = serde_json::to_vec_pretty(&new_state)?;
         {
             let mut f = File::create(&tmp_meta)?;
             f.write_all(&meta_bytes)?;
             f.sync_all()?;
         }
-        fs::rename(tmp_meta, &self.materialized_state_path)?;
+        fs::rename(&tmp_meta, &self.materialized_state_path)?;
 
         Ok((written_count, conflicts))
     }
