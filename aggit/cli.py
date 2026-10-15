@@ -9,6 +9,7 @@ import argparse
 import json
 from .engine import AgGitEngine
 from .git_bridge import GitBridge
+from .path_utils import sanitize_repo_path
 
 def main():
     parser = argparse.ArgumentParser(
@@ -64,6 +65,7 @@ def main():
     resolve_parser = subparsers.add_parser("resolve", help="Explicitly resolve a pending conflict on a path")
     resolve_parser.add_argument("target_path", help="Path of the conflicted file")
     resolve_parser.add_argument("--file", default=None, help="File containing resolved content (omit to resolve by deletion)")
+    resolve_parser.add_argument("--content", default=None, help="Inline string content for resolution")
     resolve_parser.add_argument("--agent", default="resolver", help="Agent identifier")
     resolve_parser.add_argument("-m", "--message", default=None, help="Resolution message")
     resolve_parser.add_argument("--path", default=".", help="Repository directory")
@@ -236,6 +238,8 @@ def main():
                 sys.exit(1)
             with open(args.file, "rb") as f:
                 resolved_bytes = f.read()
+        elif args.content is not None:
+            resolved_bytes = args.content.encode("utf-8")
 
         try:
             tx = engine.resolve_conflict(
@@ -244,6 +248,14 @@ def main():
                 agent_id=args.agent,
                 message=args.message
             )
+            # Verify whether conflict was completely cleared
+            _, remaining_conflicts = engine.reconcile_state(dry_run=True)
+            norm_target = sanitize_repo_path(repo_dir, args.target_path)
+            still_pending = [c for c in remaining_conflicts if (c.file_path == norm_target or c.path == norm_target)]
+            if still_pending:
+                print(f"Error: Resolution did not clear all conflicts on '{args.target_path}'. {len(still_pending)} conflict(s) still pending.", file=sys.stderr)
+                sys.exit(1)
+
             print(f"[AgGit] Conflict on '{args.target_path}' successfully resolved via tx {tx.tx_id[:8]}.")
         except Exception as e:
             print(f"Error resolving conflict: {e}", file=sys.stderr)

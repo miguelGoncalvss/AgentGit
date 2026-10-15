@@ -155,10 +155,30 @@ class Journal:
                     pass
             raise
 
-        # Update index under exclusive lock to avoid stale cache clobbering
+        tx_meta = {
+            "filename": filename,
+            "tx_id": tx.tx_id,
+            "agent_id": tx.agent_id,
+            "session_id": tx.session_id,
+            "timestamp_ns": tx.timestamp_ns,
+            "timestamp": tx.timestamp,
+            "message": tx.message,
+            "parents": tx.parents,
+            "base_revision": tx.base_revision,
+            "schema_version": tx.schema_version
+        }
+
+        # Update index incrementally under exclusive lock (O(1))
         lock_path = self.index_path + ".lock"
         with file_lock(lock_path):
-            index = self._rebuild_index()
+            index = self._load_index()
+            if not index or "by_id" not in index or "all_tx_ids" not in index:
+                index = self._rebuild_index()
+            else:
+                index["by_id"][tx.tx_id] = tx_meta
+                if tx.tx_id not in index["all_tx_ids"]:
+                    index["all_tx_ids"].append(tx.tx_id)
+                index["head_tx_id"] = tx.tx_id
             self._save_index(index)
 
         return tx
