@@ -30,16 +30,16 @@ Executado em ambiente Windows 11 (SSD NVMe PCIe Gen4, 8 threads concorrentes, Py
 
 | Sistema | Sucesso | Taxa de Erro | Tempo Total (s) | Throughput (ops/s) | Latência p50 | Latência p95 | Conteúdo Verificado |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Git (Shared Index)** | 6/20 | **70.0%** | 0.57s | 10.53 | 185ms | 340ms | Não (14 falhas) |
-| **Git (Worktree por Agente)** | 20/20 | 0.0% | 1.28s | 15.57 | 450ms | 610ms | Sim (100%) |
-| **AgGit (Python Engine)** | 20/20 | **0.0%** | 0.79s | 25.26 | 32ms | 78ms | Sim (100%) |
-| **AgGit (Rust Native Engine)** | 20/20 | **0.0%** | **0.34s** | **58.48** | **12ms** | **28ms** | Sim (100%) |
+| **Git (Shared Index)** | 7/20 | **65.0%** | 0.56s | 12.61 | 128ms | 187ms | Não (13 falhas) |
+| **Git (Worktree por Agente)** | 20/20 | 0.0% | 1.26s | 15.83 | 377ms | 389ms | Sim (100%) |
+| **AgGit (Python Engine)** | 20/20 | **0.0%** | 1.12s | 17.89 | 66ms | 283ms | Sim (100%) |
+| **AgGit (Rust Native Engine)** | 20/20 | **0.0%** | **0.10s** | **207.99** | **19ms** | **31ms** | Sim (100%) |
 
 ### Análise Comparativa:
-- O **Git com índice compartilhado** sofre com contenção severa: 70% das tentativas falham imediatamente com erro de lock (`Unable to create '.git/index.lock': File exists`).
-- O **Git com worktrees** resolve o problema de concorrência garantindo 100% de sucesso, porém a criação física de branches e cópia de diretórios gera sobrecarga substancial de I/O no sistema de arquivos, resultando em latência $p_{95}$ de 610ms.
-- O **AgGit (Python Engine)** opera sem locks globais de índice, delegando o trabalho para arquivos de staging isolados por sessão. Mesmo incluindo o tempo de reconciliação e materialização de 3 vias no disco, atinge throughput 1.6x superior ao Git Worktrees.
-- O **AgGit (Rust Native Engine)** reduz drasticamente a latência e o consumo de CPU: com CAS nativo e journal em tempo constante, atinge **58.48 ops/s** e latência $p_{50}$ de apenas 12ms — **3.7x mais rápido** que o Git Worktrees, mantendo integridade física 100% verificada.
+- O **Git com índice compartilhado** sofre com contenção severa: 65% das tentativas falham imediatamente com erro de lock (`Unable to create '.git/index.lock': File exists`).
+- O **Git com worktrees** resolve o problema de concorrência garantindo 100% de sucesso, porém a criação física de branches e cópia de diretórios gera sobrecarga substancial de I/O no sistema de arquivos, resultando em latência $p_{95}$ de 389ms.
+- O **AgGit (Python Engine)** opera sem locks globais de índice, delegando o trabalho para arquivos de staging isolados por sessão. Mesmo incluindo o tempo de reconciliação e materialização de 3 vias no disco, atinge throughput superior ao Git Worktrees.
+- O **AgGit (Rust Native Engine)** reduz drasticamente a latência e o consumo de CPU: com CAS nativo e journal em tempo constante ($O(1)$), atinge **207.99 ops/s** e latência $p_{50}$ de apenas 19ms — **13.1x mais rápido** que o Git Worktrees, mantendo integridade física 100% verificada.
 
 ---
 

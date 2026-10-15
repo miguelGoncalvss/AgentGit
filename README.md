@@ -190,10 +190,10 @@ Benchmark executed with **20 concurrent AI agents** under realistic workload on 
 
 | System | Success Rate | Error Rate | Total Time | Throughput (ops/s) | Latency p50 | Latency p95 |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Git (Shared Index)** | 6/20 | **70.0%** | 0.57s | 10.53 | 185ms | 340ms |
-| **Git (Worktree per Agent)** | 20/20 | 0.0% | 1.28s | 15.57 | 450ms | 610ms |
-| **AgGit (Python Engine)** | 20/20 | **0.0%** | 0.79s | 25.26 | 32ms | 78ms |
-| **AgGit (Rust Native Engine)** | 20/20 | **0.0%** | **0.34s** | **58.48** | **12ms** | **28ms** |
+| **Git (Shared Index)** | 7/20 | **65.0%** | 0.56s | 12.61 | 128ms | 187ms |
+| **Git (Worktree per Agent)** | 20/20 | 0.0% | 1.26s | 15.83 | 377ms | 389ms |
+| **AgGit (Python Engine)** | 20/20 | **0.0%** | 1.12s | 17.89 | 66ms | 283ms |
+| **AgGit (Rust Native Engine)** | 20/20 | **0.0%** | **0.10s** | **207.99** | **19ms** | **31ms** |
 
 *All AgGit runs include 100% cryptographic SHA-256 byte verification of all generated files.*
 
@@ -207,10 +207,14 @@ See [docs/benchmarks.md](docs/benchmarks.md) for full details.
 
 ## 🧪 Test Suite
 
-Over 30 comprehensive automated test scenarios validate path sanitization (symlinks, Windows reserved device names), CAS integrity, staging session locking, DAG reconciliation, conflict lifecycle, 3-state pre-validation, and Git export continuity:
+Over 40 comprehensive automated test scenarios across Python and 12 native Rust integration tests validate staging session locking, DAG reconciliation, conflict lifecycle, JSON recursive merge, pure dry-run CAS isolation, delimited Git export, 3-state pre-validation, and path security:
 
 ```bash
-# Run all Python regression and integrity test suites:
+# Run all Python regression and deep integrity test suites:
+python -m unittest discover -s tests -v
+
+# Or individually:
+python -m unittest tests/test_deep_integrity_regressions.py -v
 python tests/test_all_regressions.py -v
 python tests/test_revisions_export_integrity.py -v
 
