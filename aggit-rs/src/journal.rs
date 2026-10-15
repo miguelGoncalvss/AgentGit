@@ -49,6 +49,34 @@ impl Journal {
         Ok(tx)
     }
 
+    pub fn append_transaction_with_metadata(
+        &self,
+        _storage: &CASStorage,
+        agent_id: &str,
+        session_id: Option<&str>,
+        message: &str,
+        changes: HashMap<String, ChangeRecord>,
+        parents: Vec<String>,
+        base_revision: Option<String>,
+        metadata: serde_json::Value,
+    ) -> std::io::Result<Transaction> {
+        let tx = Transaction::new_with_metadata(agent_id, session_id, message, changes, parents, base_revision, metadata);
+
+        let filename = format!("{:020}_{}_{}.json", tx.timestamp_ns, tx.agent_id, tx.tx_id);
+        let tx_path = self.journal_dir.join(&filename);
+        let tmp_path = self.journal_dir.join(format!(".tmp_tx_{}_{}.tmp", std::process::id(), uuid::Uuid::new_v4()));
+
+        let json_data = serde_json::to_vec_pretty(&tx)?;
+        {
+            let mut f = File::create(&tmp_path)?;
+            f.write_all(&json_data)?;
+            f.sync_all()?;
+        }
+
+        fs::rename(&tmp_path, &tx_path)?;
+        Ok(tx)
+    }
+
     /// Reads all published transactions in parallel using Rayon and returns them sorted by timestamp_ns.
     /// Only reads complete files with extension 'json' that do not start with '.tmp'.
     pub fn get_all_transactions(&self) -> Result<Vec<Transaction>, String> {
