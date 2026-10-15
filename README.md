@@ -1,235 +1,237 @@
-# AgGit: Version Control System para Sistemas Multi-Agentes de IA
+# AgGit: Version Control System for Multi-Agent AI Systems
 
 [![Build & Test](https://github.com/miguelGoncalvss/AgentGit/actions/workflows/ci.yml/badge.svg)](https://github.com/miguelGoncalvss/AgentGit/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust: 1.80+](https://img.shields.io/badge/Rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 [![Python: 3.10+](https://img.shields.io/badge/Python-3.10%2B-green.svg)](https://www.python.org)
 
-O **AgGit** é um sistema de controle de versão moderno projetado especificamente para **Sistemas Multi-Agentes (MAS)**. Ele substitui a trava exclusiva monolítica do Git (`.git/index.lock`) por uma arquitetura de diário append-only concorrente, áreas de staging isoladas por sessão, reconciliação de três vias com preservação semântica e integração segura com Git e GitHub.
+🌐 **Translations / Idiomas:** [English](README.md) | [Português (Brasil)](docs/translations/README.pt-BR.md) | [Español](docs/translations/README.es.md)
+
+**AgGit** is a modern version control system designed specifically for **Multi-Agent Systems (MAS)**. It replaces Git's monolithic exclusive lock (`.git/index.lock`) with a concurrent append-only event journal, session-isolated staging areas, 3-way semantic reconciliation, and safe, isolated Git/GitHub integration.
 
 ---
 
-## 📑 Sumário
+## 📑 Table of Contents
 
-- [Visão Geral e Conceitos](#-visão-geral-e-conceitos)
-- [Garantias de Concorrência e Persistência](#-garantias-de-concorrência-e-persistência)
-- [Requisitos e Instalação](#-requisitos-e-instalação)
-- [Guia de Uso Rápido](#-guia-de-uso-rápido)
-- [Resolução de Conflitos](#-resolução-de-conflitos)
-- [Integração com Git e GitHub](#-integração-com-git-e-github)
+- [Overview & Core Concepts](#-overview--core-concepts)
+- [Concurrency & Durability Guarantees](#-concurrency--durability-guarantees)
+- [Requirements & Installation](#-requirements--installation)
+- [Quick Start Guide](#-quick-start-guide)
+- [Conflict Resolution & Lifecycle](#-conflict-resolution--lifecycle)
+- [3-State Safe Materialization](#-3-state-safe-materialization)
+- [Git & GitHub Integration](#-git--github-integration)
 - [Benchmarks](#-benchmarks)
-- [Suíte de Testes](#-suíte-de-testes)
-- [Limitações Conhecidas](#-limitações-conhecidas)
-- [Documentação Técnica Adicional](#-documentação-técnica-adicional)
+- [Test Suite](#-test-suite)
+- [Known Limitations](#-known-limitations)
+- [Additional Technical Documentation](#-additional-technical-documentation)
 
 ---
 
-## 💡 Visão Geral e Conceitos
+## 💡 Overview & Core Concepts
 
-Para evitar as ambiguidades comuns em sistemas distribuídos, o AgGit adota termos formais:
+To eliminate ambiguities in distributed agent environments, AgGit adopts formal definitions:
 
-- **Agente (`agent_id`)**: A identidade lógica do agente de IA (ex: `agent_backend`, `agent_qa`).
-- **Sessão (`session_id`)**: O contexto de execução atual do agente. Permite que o mesmo agente execute tarefas paralelas sem sobrescrever seu próprio staging.
-- **Revisão (`tx_id`)**: Um identificador imutável (UUID v4) de uma transação publicada no journal, contendo metadados, autores, base e alterações de arquivos.
-- **Base de Revisão (`base_revision`)**: O identificador exato da revisão a partir da qual o agente iniciou seu trabalho. Impede que merges assumam bases vazias ou ancestrais incorretos.
-- **Checkpoint**: Um snapshot derivado e recuperável (`.aggit/checkpoints/latest.json`) que registra a fronteira causal incorporada até o momento, permitindo reconciliação incremental em tempo constante.
-
----
-
-## 🔒 Garantias de Concorrência e Persistência
-
-- **Publicação Atômica**: Os objetos no CAS e os eventos no diário são gravados em arquivos temporários exclusivos (`.tmp`) com `fsync` explícito e renomeados atomicamente pelo sistema operacional (`os.replace` / `fs::rename`).
-- **Leitura Segura**: Arquivos em processo de escrita nunca são tratados como transações concluídas por processos concorrentes.
-- **Sem Perda de Atualização no Staging**: As áreas de staging utilizam um contador de geração (`generation`). Commits anteriores não removem arquivos adicionados por operações mais recentes.
-- **Integridade Criptográfica**: Todos os objetos do CAS têm seu hash SHA-256 recalculado e validado durante a leitura.
+- **Agent (`agent_id`)**: The logical identity of the AI agent (e.g., `agent_backend`, `agent_qa`).
+- **Session (`session_id`)**: The active execution context of the agent. Allows the same agent to execute concurrent parallel tasks without overwriting its own staging area.
+- **Revision (`tx_id`)**: An immutable identifier (UUID v4) for an event published to the journal, containing metadata, authors, causal base, and file operations.
+- **Base Revision (`base_revision`)**: The exact revision hash from which the agent started its work. Prevents merges from assuming empty bases or incorrect linear ancestors.
+- **Checkpoint**: A recoverable derived snapshot (`.aggit/checkpoints/latest.json`) recording the incorporated causal boundary, enabling $O(1)$ incremental reconciliation.
 
 ---
 
-## 🛠️ Requisitos e Instalação
+## 🔒 Concurrency & Durability Guarantees
 
-### Requisitos
-- **Git** 2.30+ instalado no sistema.
-- **Python** 3.10+ (para execução via CLI Python).
-- **Rust** 1.80+ e Cargo (caso deseje compilar o binário nativo).
-- **GitHub CLI (`gh`)** (opcional, necessário apenas para abertura automatizada de Pull Requests).
+- **Atomic Publication**: CAS storage objects and journal events are written to exclusive temporary files (`.tmp`) with explicit `fsync` and renamed atomically via OS primitives (`os.replace` / `fs::rename`).
+- **Safe Concurrent Reading**: In-flight temporary files are never treated as completed transactions by readers.
+- **No Lost Updates in Staging**: Staging areas feature a monotonic `generation` counter and cross-platform per-session file locks (`<path>.lock`). Previous commits do not wipe files staged by concurrent operations.
+- **Cryptographic Integrity**: All CAS objects have their SHA-256 hashes validated during read and decompression.
 
-### Compilação do Binário Nativo em Rust
+---
+
+## 🛠️ Requirements & Installation
+
+### Prerequisites
+- **Git** 2.30+ installed.
+- **Python** 3.10+ (for Python CLI execution).
+- **Rust** 1.80+ and Cargo (for compiling the native Rust binary).
+- **GitHub CLI (`gh`)** (optional, required only for automated Pull Request creation).
+
+### Native Rust Build
 ```bash
 cd aggit-rs
 cargo build --release
-# O executável será gerado em: target/release/aggit (ou aggit.exe no Windows)
+# The binary is generated at: target/release/aggit (or aggit.exe on Windows)
 ```
 
 ---
 
-## 🚀 Guia de Uso Rápido
+## 🚀 Quick Start Guide
 
-### 1. Inicializar Repositório
+### 1. Initialize Repository
 ```bash
-# Via executável compilado:
+# Via native binary:
 ./aggit init
 
-# Ou via módulo Python:
+# Or via Python module:
 python -m aggit.cli init
 ```
 
-### 2. Preparação (Staging) e Commit
+### 2. Staging & Committing
 ```bash
-# Agente A prepara arquivos no seu namespace de sessão
+# Agent A stages files within its isolated session namespace
 ./aggit stage src/auth.py --agent agent_backend --session sprint_1
 
-# Agente B prepara arquivos simultaneamente sem colisão
+# Agent B stages files simultaneously without index contention
 ./aggit stage src/ui.py --agent agent_frontend --session sprint_1
 
-# Agente A comita informando mensagem e base
+# Agent A commits specifying message and session context
 ./aggit commit -m "feat: user authentication endpoint" --agent agent_backend --session sprint_1
 
-# Agente B comita no mesmo instante
+# Agent B commits concurrently
 ./aggit commit -m "feat: login interface" --agent agent_frontend --session sprint_1
 ```
 
-### 3. Exclusão de Arquivos no Staging
+### 3. File Deletion in Staging
 ```bash
 ./aggit stage-delete src/legacy.py --agent agent_backend
 ./aggit commit -m "chore: remove deprecated file" --agent agent_backend
 ```
 
-### 4. Consultar Status e Histórico
+### 4. Status & History
 ```bash
 ./aggit status
 ./aggit log -n 5
 ```
 
-### 5. Reconciliar e Materializar no Diretório de Trabalho
-A reconciliação incremental processa apenas eventos novos desde o último checkpoint e grava somente arquivos modificados:
+### 5. Reconcile & Materialize to Working Tree
+Incremental reconciliation processes only transactions appended since the last checkpoint and writes only modified files:
 ```bash
-# Simulação sem aplicar alterações (Dry-Run):
+# Dry-run calculation without disk or state mutation:
 python -m aggit.cli reconcile --dry-run
 
-# Reconciliação e materialização segura com pré-validação em 3 estados:
+# Reconcile with 3-state pre-flight validation:
 python -m aggit.cli reconcile
 
-# Forçar materialização sobrescrevendo alterações locais caso necessário:
+# Force overwrite local changes if intentionally needed:
 python -m aggit.cli reconcile --force
 ```
 
-### 6. Resolução Explícita de Conflitos
-Conflitos não resolvidos persistem nos checkpoints e bloqueiam materializações e exportações até serem resolvidos:
+### 6. Explicit Conflict Resolution
+Unresolved conflicts persist across restarts in checkpoints and block materialization and Git export until resolved:
 ```bash
-# Resolver conflito apontando o conteúdo resolvido:
+# Resolve conflict by providing resolved content inline:
 python -m aggit.cli resolve src/config.py --content "PORT = 8080\nDEBUG = False" -m "fix: resolve port conflict" --agent agent_lead
 
-# Ou resolver a partir de um arquivo físico no disco:
+# Or resolve conflict from a file on disk:
 python -m aggit.cli resolve src/config.py --file src/config_resolved.py -m "fix: resolved config"
 ```
 
 ---
 
-## ⚖️ Resolução de Conflitos e Ciclo de Vida
+## ⚖️ Conflict Resolution & Lifecycle
 
-O motor de 3 vias do AgGit classifica e trata conflitos de forma determinística e persistente:
+AgGit's 3-way reconciliation engine classifies and handles divergence deterministically:
 
-1. **Alterações Ortogonais**:
-   - Se dois agentes modificam arquivos diferentes ou seções distintas de um arquivo de texto, o merge é limpo e 100% automático.
-2. **Arquivos JSON**:
-   - Chaves independentes adicionadas por agentes distintos (ex: `{"porta": 3000}` e `{"debug": true}`) são unidas automaticamente no objeto base sem gerar conflito.
-   - Objetos aninhados são mesclados recursivamente.
-3. **Persistência de Conflitos Pendentes**:
-   - Conflitos de conteúdo, modificação/exclusão (`modify/delete`) ou divergência binária são persistidos no Checkpoint Schema v2 (`pending_conflicts`).
-   - Repetir `reconcile`, `status` ou `export-preview` **mantém os conflitos pendentes** até uma resolução explícita.
-   - Materialização no disco e exportação para Git são **estritamente bloqueadas** enquanto houver conflitos pendentes.
-4. **Resolução Rastreável**:
-   - A operação `aggit resolve` grava uma transação formal no diário que unifica as versões divergentes no grafo causal e libera o pipeline.
-
----
-
-## 🛡️ Materialização Segura em 3 Estados
-
-Para proteger o trabalho do desenvolvedor humano, a materialização realiza uma validação trifásica prévia (*pre-flight validation*):
-- Compara: (1) Último estado materializado registrado, (2) Conteúdo físico atual no disco, e (3) Estado desejado reconciliado.
-- Detecta:
-  - **Edições locais**: se o arquivo no disco foi alterado manualmente após a última materialização, a escrita é abortada.
-  - **Exclusões locais**: se o usuário apagou o arquivo localmente, a substituição é prevenida.
-  - **Arquivos não rastreados**: impede que a materialização sobrescreva arquivos locais não gerenciados pelo AgGit.
-- Escrita atômica: atualizações são gravadas em arquivos temporários exclusivos (`.tmp_mat_<pid>_<thread>_<uuid>.tmp`) com `fsync` e substituição atômica (`os.replace`). O manifesto só é atualizado após a confirmação no disco.
+1. **Orthogonal Modifications**:
+   - Distinct files or non-overlapping line ranges in text files are automatically merged without human intervention.
+2. **JSON Files**:
+   - Independent keys added by different agents (e.g., `{"port": 3000}` and `{"debug": true}`) are cleanly merged recursively into the base dictionary without conflict.
+3. **Persistent Conflict Lifecycle**:
+   - Overlapping edits, modify/delete incompatibilities, and binary divergence are stored in Checkpoint Schema v2 (`pending_conflicts`).
+   - Re-running `reconcile`, `status`, or `export-preview` **preserves pending conflicts** until explicit resolution.
+   - Materialization to disk and export to Git are **strictly blocked** while pending conflicts exist.
+4. **Traceable Resolution**:
+   - The `aggit resolve` command writes a formal resolution transaction to the journal DAG, superseding the divergent revisions and unblocking the pipeline.
 
 ---
 
-## 🐙 Integração com Git e GitHub
+## 🛡️ 3-State Safe Materialization
 
-O AgGit permite sincronizar o trabalho dos agentes com o Git tradicional sem poluir a branch de trabalho ou o workspace principal:
+To protect human developer edits and prevent data loss, materialization executes a 3-state pre-flight validation:
+- Compares: (1) Last recorded materialized manifest, (2) Current physical disk state, and (3) Desired reconciled state.
+- Detects:
+  - **Local manual edits**: if physical disk content diverges from the recorded manifest, the operation is aborted.
+  - **Local deletions**: if a file was manually deleted by the user, accidental restoration is prevented.
+  - **Untracked files**: prevents AgGit from silently overwriting files created outside version control.
+- Atomic write: updates are written to exclusive temporary files (`.tmp_mat_<pid>_<thread>_<uuid>.tmp`) with `fsync` and atomic replacement (`os.replace`). The manifest is only updated after physical disk confirmation.
+
+---
+
+## 🐙 Git & GitHub Integration
+
+AgGit synchronizes multi-agent work with traditional Git without interfering with the user's primary working tree:
 
 ```bash
-# 1. Prévia em memória (Dry-Run): lista arquivos e conflitos sem alterar o Git ou checkpoints
+# 1. In-memory Dry-Run: inspect plan and conflicts without touching Git or checkpoints
 python -m aggit.cli export-preview --branch feature/agent-sprint
 
-# 2. Exportação isolada: cria um commit limpo em worktree temporário preservando continuidade
+# 2. Isolated export: creates a clean commit in a temporary worktree preserving branch continuity
 python -m aggit.cli export-git --branch feature/agent-sprint -m "feat: autonomous sprint sync"
 
-# 3. Publicação explícita (Push):
+# 3. Explicit push:
 python -m aggit.cli push --branch feature/agent-sprint --remote origin
 
-# 4. Criar ou reutilizar Pull Request via GitHub CLI:
+# 4. Create or reuse Pull Request via GitHub CLI:
 python -m aggit.cli pr --branch feature/agent-sprint --base-branch main
 
-# 5. Importar um commit do Git como ponto de partida no AgGit:
+# 5. Import existing Git commit as base:
 python -m aggit.cli import-git --ref HEAD
 ```
 
-- **Continuidade de Branch**: Múltiplos exports sequenciais para a mesma branch mantêm a genealogia de commits (`commit 1 -> commit 2`) sem reset destrutivo.
-- **Preservação de Arquivos Git**: Arquivos pré-existentes no repositório Git (como `keep.md`, `README.md`, `.github/`) são estritamente preservados; apenas arquivos expressamente marcados com `action: "delete"` pelo AgGit são removidos.
-- **Repositórios Vazios**: Suporte a exportação inicial mesmo em repositórios Git recém-criados sem commits, utilizando plumbing Git de árvore vazia sem interferir no índice do usuário.
+- **Branch Continuity**: Sequential exports to the same branch maintain commit lineage (`commit 1 -> commit 2`) without destructive force resets (`-B`).
+- **File Preservation**: Unrelated files on the Git branch (such as `keep.md`, `README.md`, `.github/`) are strictly preserved. Only files explicitly recorded as `action: "delete"` in AgGit are deleted from Git.
+- **Empty Repositories**: Supports root commit creation on empty Git repositories using empty tree plumbing (`git commit-tree 4b825dc...`) without capturing uncommitted files from the workspace.
 
 ---
 
 ## 📊 Benchmarks
 
-Comparativo executado com **20 agentes de IA concorrentes** sob carga real em Windows 11 (SSD NVMe, 8 threads concorrentes):
+Benchmark executed with **20 concurrent AI agents** under realistic workload on Windows 11 (NVMe PCIe Gen4 SSD, 8 concurrent threads):
 
-| Sistema | Sucessos | Taxa de Erro | Tempo Total | Throughput (ops/s) | Latência p50 | Latência p95 |
+| System | Success Rate | Error Rate | Total Time | Throughput (ops/s) | Latency p50 | Latency p95 |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Git (Índice Compartilhado)** | 6/20 | **70.0%** | 0.57s | 10.53 | 185ms | 340ms |
-| **Git (Worktree por Agente)** | 20/20 | 0.0% | 1.28s | 15.57 | 450ms | 610ms |
+| **Git (Shared Index)** | 6/20 | **70.0%** | 0.57s | 10.53 | 185ms | 340ms |
+| **Git (Worktree per Agent)** | 20/20 | 0.0% | 1.28s | 15.57 | 450ms | 610ms |
 | **AgGit (Python Engine)** | 20/20 | **0.0%** | 0.79s | 25.26 | 32ms | 78ms |
 | **AgGit (Rust Native Engine)** | 20/20 | **0.0%** | **0.34s** | **58.48** | **12ms** | **28ms** |
 
-*Todas as execuções do AgGit incluem verificação de integridade criptográfica SHA-256 de 100% dos arquivos gerados.*
+*All AgGit runs include 100% cryptographic SHA-256 byte verification of all generated files.*
 
-Para reproduzir os testes com cálculo preciso de percentis e verificação de integridade:
+To reproduce benchmarks with exact percentile calculations and verification:
 ```bash
 python benchmark.py
 ```
-Mais detalhes em [docs/benchmarks.md](docs/benchmarks.md).
+See [docs/benchmarks.md](docs/benchmarks.md) for full details.
 
 ---
 
-## 🧪 Suíte de Testes
+## 🧪 Test Suite
 
-O projeto conta com mais de 30 cenários automatizados cobrindo sanitização de caminhos (symlinks, Windows reserved names), integridade de CAS, concorrência de staging com locks de sessão, integridade de reconciliação de revisões, ciclo de vida de conflitos, pré-validação trifásica e exportação contínua para Git:
+Over 30 comprehensive automated test scenarios validate path sanitization (symlinks, Windows reserved device names), CAS integrity, staging session locking, DAG reconciliation, conflict lifecycle, 3-state pre-validation, and Git export continuity:
 
 ```bash
-# Executar todos os testes de regressão e integridade em Python:
+# Run all Python regression and integrity test suites:
 python tests/test_all_regressions.py -v
 python tests/test_revisions_export_integrity.py -v
 
-# Executar testes nativos em Rust:
+# Run native Rust test suite:
 cd aggit-rs && cargo test
 ```
 
 ---
 
-## ⚠️ Limitações Conhecidas
+## ⚠️ Known Limitations
 
-1. **Atributos de Arquivo do Sistema Operacional**: Permissões POSIX avançadas (ex: modo executável `chmod +x`) e symlinks ainda não são serializados nos blobs do CAS atual.
-2. **Sincronização Bidirecional**: O AgGit suporta importação inicial de commits Git e exportação de branches AgGit para Git. Atualizações contínuas do Git remoto exigem comandos explícitos de `import-git` ou rebase assistido.
-3. **GitHub CLI**: A automação de Pull Requests depende da presença do utilitário `gh` autenticado. Em ambientes sem `gh`, a exportação para Git e push continuam funcionando normalmente.
+1. **POSIX File Attributes**: Advanced permissions (such as `chmod +x` executable bits) and in-repo symlinks are not yet serialized in current CAS blobs.
+2. **Continuous Bidirectional Sync**: AgGit supports initial Git commit import and isolated export to Git branches. Branches receiving continuous concurrent commits directly in Git require explicit `import-git` workflows.
+3. **GitHub CLI**: Automated Pull Request creation relies on the `gh` utility being installed and authenticated.
 
 ---
 
-## 📚 Documentação Técnica Adicional
+## 📚 Additional Technical Documentation
 
-- [Arquitetura Completa](docs/architecture.md)
-- [Formato de Armazenamento e Schemas](docs/storage-format.md)
-- [Integração Detalhada com Git & GitHub](docs/github-integration.md)
-- [Relatório e Metodologia de Benchmarks](docs/benchmarks.md)
-- [Guia de Migração de Formatos](docs/migration.md)
+- [System Architecture](docs/architecture.md)
+- [Storage Format & Schemas](docs/storage-format.md)
+- [Git & GitHub Integration Guide](docs/github-integration.md)
+- [Benchmark Methodology & Results](docs/benchmarks.md)
+- [Format Compatibility & Migration Guide](docs/migration.md)
