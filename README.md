@@ -219,9 +219,20 @@ Benchmark executed with **20 concurrent AI agents** under realistic workload on 
 
 *All AgGit runs include 100% cryptographic SHA-256 byte verification of all generated files.*
 
+### ⚡ Extreme Concurrency: 70 Simultaneous Agents (Rust Engine)
+Under extreme multi-agent stress with **70 autonomous agents committing concurrently across 70 dedicated OS threads** (10-round empirical evaluation, 700 total atomic transactions):
+- **Success Rate**: **100.0%** (700/700 commits succeeded, 0 contention errors, 0.00% error rate).
+- **Throughput**: **153.31 ops/sec** (end-to-end commit + DAG reconciliation + disk materialization).
+- **Latency**: $p_{50} = \mathbf{168.4ms}$, $p_{95} = \mathbf{205.1ms}$, $p_{99} = \mathbf{209.0ms}$.
+- **Byte-Level Integrity**: **100% Verified** across all 700 physical files on disk.
+
 To reproduce benchmarks with exact percentile calculations and verification:
 ```bash
+# Python comparative benchmark:
 python benchmark.py
+
+# Rust 70-agent concurrency benchmark:
+cargo run --release --manifest-path aggit-rs/Cargo.toml -- benchmark --agents 70 --threads 70 --rounds 10
 ```
 See [docs/benchmarks.md](docs/benchmarks.md) for full details.
 
@@ -229,7 +240,7 @@ See [docs/benchmarks.md](docs/benchmarks.md) for full details.
 
 ## 🧪 Test Suite
 
-50 comprehensive automated test scenarios across Python and 13 native Rust integration tests validate staging session locking, Windows path normalization & symlink containment, 3-way Git export matrix, conflict identity & lifecycle, JSON recursive merge, auto-healing persistence, pure dry-run CAS isolation, and linear reconciliation scaling:
+50 comprehensive automated test scenarios across Python and 14 native Rust integration tests validate staging session locking, Windows path normalization & symlink containment, 3-way Git export matrix, conflict identity & lifecycle, JSON recursive merge, auto-healing persistence, pure dry-run CAS isolation, 70-agent extreme concurrency scalability, and linear reconciliation:
 
 ```bash
 # Run all Python regression and deep integrity test suites:

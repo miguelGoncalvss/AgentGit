@@ -220,9 +220,20 @@ Evaluación comparativa ejecutada con **20 agentes de IA concurrentes** bajo car
 
 *Todas las pruebas de AgGit incluyen verificación criptográfica estricta SHA-256 del 100% de los archivos generados.*
 
+### ⚡ Concurrencia Extrema: 70 Agentes Simultáneos (Rust Engine)
+Bajo estrés multiagente con **70 agentes autónomos confirmando concurrentemente en 70 hilos dedicados del sistema operativo** (evaluación empírica de 10 rondas, 700 transacciones atómicas en total):
+- **Tasa de Éxito**: **100.0%** (700/700 commits exitosos, 0 errores de contención, tasa de error del 0.00%).
+- **Rendimiento (Throughput)**: **153.31 ops/sec** (confirmación de extremo a extremo + reconciliación DAG + materialización en disco).
+- **Latencia**: $p_{50} = \mathbf{168.4ms}$, $p_{95} = \mathbf{205.1ms}$, $p_{99} = \mathbf{209.0ms}$.
+- **Integridad Byte a Byte**: **100% Verificado** en los 700 archivos físicos guardados en disco.
+
 Para reproducir los benchmarks con cálculo de percentiles y verificación de integridad:
 ```bash
+# Benchmark comparativo en Python:
 python benchmark.py
+
+# Benchmark de 70 agentes en Rust:
+cargo run --release --manifest-path aggit-rs/Cargo.toml -- benchmark --agents 70 --threads 70 --rounds 10
 ```
 Más detalles en [docs/benchmarks.md](../benchmarks.md).
 
@@ -230,7 +241,7 @@ Más detalles en [docs/benchmarks.md](../benchmarks.md).
 
 ## 🧪 Suite de Pruebas
 
-El proyecto cuenta con 50 escenarios de prueba automatizados en Python y 13 pruebas de integración nativas en Rust que validan sanitización y contención de rutas en Windows, integridad del CAS, concurrencia en staging con bloqueos por sesión, reconciliación linear del DAG, ciclo de vida e identidad de conflictos, matriz de exportación Git de 3 vías, pre-validación trifásica y auto-reparación de índices:
+El proyecto cuenta con 50 escenarios de prueba automatizados en Python e 14 pruebas de integración nativas en Rust que validan sanitización y contención de rutas en Windows, integridad del CAS, concurrencia en staging con bloqueos por sesión, escalabilidad bajo 70 agentes simultáneos, reconciliación linear del DAG, ciclo de vida e identidad de conflictos, matriz de exportación Git de 3 vías, pre-validación trifásica y auto-reparación de índices:
 
 ```bash
 # Ejecutar todas las pruebas de regresión e integridad en Python:

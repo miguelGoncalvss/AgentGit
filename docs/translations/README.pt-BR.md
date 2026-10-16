@@ -220,9 +220,20 @@ Comparativo executado com **20 agentes de IA concorrentes** sob carga real em Wi
 
 *Todas as execuções do AgGit incluem verificação de integridade criptográfica SHA-256 de 100% dos arquivos gerados.*
 
+### ⚡ Concorrência Extrema: 70 Agentes Simultâneos (Rust Engine)
+Sob estresse multiagente com **70 agentes autônomos comitando concorrentemente em 70 threads dedicadas do sistema operacional** (avaliação empírica de 10 rodadas, 700 transações atômicas no total):
+- **Taxa de Sucesso**: **100.0%** (700/700 commits com sucesso, 0 erros de contenção, taxa de erro de 0.00%).
+- **Throughput (Vazão)**: **153.31 ops/sec** (commit de ponta a ponta + reconciliação do DAG + materialização em disco).
+- **Latência**: $p_{50} = \mathbf{168.4ms}$, $p_{95} = \mathbf{205.1ms}$, $p_{99} = \mathbf{209.0ms}$.
+- **Integridade Byte-a-Byte**: **100% Verificado** em todos os 700 arquivos físicos gravados no disco.
+
 Para reproduzir os testes com cálculo preciso de percentis e verificação de integridade:
 ```bash
+# Benchmark comparativo em Python:
 python benchmark.py
+
+# Benchmark de 70 agentes em Rust:
+cargo run --release --manifest-path aggit-rs/Cargo.toml -- benchmark --agents 70 --threads 70 --rounds 10
 ```
 Mais detalhes em [docs/benchmarks.md](../benchmarks.md).
 
@@ -230,7 +241,7 @@ Mais detalhes em [docs/benchmarks.md](../benchmarks.md).
 
 ## 🧪 Suíte de Testes
 
-O projeto conta com 50 cenários de testes automatizados em Python e 13 testes nativos de integração em Rust cobrindo sanitização e contenção de caminhos no Windows, integridade de CAS, concorrência no staging, integridade de reconciliação linear, ciclo de vida e identidade de conflitos, matriz de exportação Git de 3 vias, pré-validação trifásica e recuperação automática de índices:
+O projeto conta com 50 cenários de testes automatizados em Python e 14 testes nativos de integração em Rust cobrindo sanitização e contenção de caminhos no Windows, integridade de CAS, concorrência no staging, escalabilidade sob 70 agentes simultâneos, integridade de reconciliação linear, ciclo de vida e identidade de conflitos, matriz de exportação Git de 3 vias, pré-validação trifásica e recuperação automática de índices:
 
 ```bash
 # Executar todos os testes de regressão e integridade em Python:

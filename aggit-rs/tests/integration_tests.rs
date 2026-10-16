@@ -371,4 +371,57 @@ fn test_rust_conflict_lifecycle_and_third_agent_edit() {
     assert!(files_final.contains_key("config.json"));
 }
 
+#[test]
+fn test_rust_70_concurrent_agents_scalability_and_byte_integrity() {
+    let dir = tempdir().unwrap();
+    let engine = AgGitEngine::init(dir.path()).unwrap();
+    let num_agents = 70;
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(num_agents)
+        .build()
+        .unwrap();
+
+    let results: Vec<bool> = pool.install(|| {
+        use rayon::prelude::*;
+        (0..num_agents)
+            .into_par_iter()
+            .map(|i| {
+                let agent_id = format!("agent_{:03}", i);
+                let mut files = HashMap::new();
+                let content = format!("// Agent {} concurrent payload\npub fn work_{}() -> usize {{ {} }}\n", i, i, i);
+                files.insert(format!("tasks/worker_{}.rs", i), content.into_bytes());
+
+                let res = engine.commit(
+                    &agent_id,
+                    None,
+                    &format!("Agent {} concurrent commit", i),
+                    Some(files),
+                    None,
+                    None,
+                );
+                res.is_ok()
+            })
+            .collect()
+    });
+
+    assert_eq!(results.len(), num_agents);
+    assert!(results.iter().all(|&ok| ok), "All 70 agents must commit successfully without lock contention");
+
+    // Reconcile and materialize all 70 files
+    let (count, conflicts) = engine.materialize(false).unwrap();
+    assert_eq!(conflicts.len(), 0, "No conflicts expected across independent agent files");
+    assert_eq!(count, num_agents, "All 70 agent files must be materialized");
+
+    // Strict byte-level payload verification
+    for i in 0..num_agents {
+        let expected = format!("// Agent {} concurrent payload\npub fn work_{}() -> usize {{ {} }}\n", i, i, i);
+        let path = dir.path().join(format!("tasks/worker_{}.rs", i));
+        assert!(path.exists(), "File tasks/worker_{}.rs must exist", i);
+        let actual = fs::read(&path).unwrap();
+        assert_eq!(actual, expected.into_bytes(), "Byte integrity mismatch for agent {}", i);
+    }
+}
+
+
 
