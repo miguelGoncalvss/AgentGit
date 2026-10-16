@@ -14,6 +14,7 @@
 ## 📑 Table of Contents
 
 - [Overview & Core Concepts](#-overview--core-concepts)
+- [How AgGit Works & Workflow Architecture](#-how-aggit-works--workflow-architecture)
 - [Concurrency & Durability Guarantees](#-concurrency--durability-guarantees)
 - [Requirements & Installation](#-requirements--installation)
 - [Quick Start Guide](#-quick-start-guide)
@@ -36,6 +37,27 @@ To eliminate ambiguities in distributed agent environments, AgGit adopts formal 
 - **Revision (`tx_id`)**: An immutable identifier (UUID v4) for an event published to the journal, containing metadata, authors, causal base, and file operations.
 - **Base Revision (`base_revision`)**: The exact revision hash from which the agent started its work. Prevents merges from assuming empty bases or incorrect linear ancestors.
 - **Checkpoint**: A recoverable derived snapshot (`.aggit/checkpoints/latest.json`) recording the incorporated causal boundary, enabling $O(1)$ incremental reconciliation.
+
+---
+
+## 🔄 How AgGit Works & Workflow Architecture
+
+> [!IMPORTANT]
+> **AgGit is a version control and synchronization layer designed to record and reconcile changes from multiple AI agents.**  
+> **It does NOT execute or manage the AI agents themselves:** your autonomous agents, background workers, or orchestrators (e.g. LangChain, CrewAI, AutoGen, custom multi-agent scripts) simply invoke AgGit's CLI or Python/Rust API to stage and commit their progress.
+
+<p align="center">
+  <img src="docs/img/mermaid-diagram.png" alt="AgGit Workflow Architecture" width="460" />
+</p>
+
+### Practical Multi-Agent Lifecycle:
+1. **Agents & Sessions (`Agentes e sessões`)**: Multiple AI agents run concurrently in designated session contexts without blocking or stepping on each other.
+2. **Isolated Staging (`Staging separado`)**: Each `(agent_id, session_id)` writes to its own isolated virtual staging space (`.aggit/staging/`), completely eliminating `.git/index.lock` contention.
+3. **Content & Transactions in `.aggit` (`Conteúdo e transações em .aggit`)**: Immutable content-addressable blobs (CAS) and append-only journal transactions (`.aggit/journal/`) record atomic progress without global locks.
+4. **Reconciliation (`Reconciliação`)**: Periodic or on-demand 3-way semantic reconciliation merges orthogonal text edits and independent JSON keys without human friction.
+5. **Conflict Handling (`Conflitos` ➔ `Resolução explícita`)**: If overlapping lines or incompatible edits conflict, deterministic conflicts are registered in the checkpoint and remain pending across reboots until explicitly resolved via `aggit resolve`.
+6. **Export to Git Branch (`Exportação para branch Git`)**: Clean reconciled states are exported via isolated worktrees to dedicated Git branches without touching user workspaces or uncommitted files.
+7. **Push & Pull Request on GitHub (`Push e PR no GitHub`)**: Seamless publishing and PR creation via GitHub CLI (`gh`).
 
 ---
 

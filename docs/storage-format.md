@@ -1,31 +1,33 @@
-# Formato de Armazenamento do AgGit
+# AgGit Storage Format Specification
 
-Este documento descreve os formatos de dados, schemas e contratos em disco do AgGit.
+🌐 **Translations / Idiomas:** English | [Português (Brasil)](translations/storage-format.pt-BR.md) | [Español](translations/storage-format.es.md)
+
+This document describes the on-disk data structures, schemas, and serialization formats used by AgGit.
 
 ---
 
 ## 1. Content-Addressable Storage (CAS)
 
-Localização: `.aggit/objects/<shard>/<rest>`  
-Onde `<shard>` são os 2 primeiros caracteres hexadecimais do hash SHA-256 e `<rest>` os 62 caracteres restantes.
+Location: `.aggit/objects/<shard>/<rest>`  
+Where `<shard>` represents the first 2 hexadecimal characters of the SHA-256 hash, and `<rest>` corresponds to the remaining 62 characters.
 
-### 1.1 Formato do Objeto
-O payload antes da compressão possui o cabeçalho idêntico ao modelo Git:
+### 1.1 Object Format
+Prior to zlib compression, payloads carry the standard Git-compatible header:
 ```
-[tipo] [tamanho_em_bytes]\0[dados_brutos]
+[type] [size_in_bytes]\0[raw_data]
 ```
-- `tipo`: string UTF-8 (`blob`, `manifest`, `tree`).
-- `tamanho_em_bytes`: representação decimal em ASCII.
-- `\0`: byte nulo delimitador.
-- Compressão: zlib nível 6 (rápida).
+- `type`: UTF-8 string (`blob`, `manifest`, `tree`).
+- `size_in_bytes`: Decimal ASCII representation.
+- `\0`: Null byte delimiter.
+- Compression: zlib level 6 (fast).
 
 ---
 
-## 2. Eventos do Journal (Transações)
+## 2. Journal Events (Transactions)
 
-Localização: `.aggit/journal/<timestamp_ns>_<agent_id>_<tx_id>.json`
+Location: `.aggit/journal/<timestamp_ns>_<agent_id>_<tx_id>.json`
 
-### 2.1 Schema Version 2 (Canônico Atual)
+### 2.1 Schema Version 2 (Current Canonical)
 ```json
 {
   "schema_version": 2,
@@ -58,9 +60,9 @@ Localização: `.aggit/journal/<timestamp_ns>_<agent_id>_<tx_id>.json`
 
 ---
 
-## 3. Staging por Sessão
+## 3. Session-Isolated Staging
 
-Localização: `.aggit/staging/<agent_safe_prefix>_<ident_hash>.json`
+Location: `.aggit/staging/<agent_safe_prefix>_<ident_hash>.json`
 
 ```json
 {
@@ -80,11 +82,11 @@ Localização: `.aggit/staging/<agent_safe_prefix>_<ident_hash>.json`
 
 ---
 
-## 4. Checkpoints de Reconciliação
+## 4. Reconciliation Checkpoints
 
-Localização: `.aggit/checkpoints/latest.json`
+Location: `.aggit/checkpoints/latest.json`
 
-### 4.1 Schema Version 2 (Canônico Atual)
+### 4.1 Schema Version 2 (Current Canonical)
 ```json
 {
   "version": 2,
@@ -113,18 +115,18 @@ Localização: `.aggit/checkpoints/latest.json`
 
 ---
 
-## 5. Ledger de Exportação para Git
+## 5. Git Export Ledger
 
-Localização: `.aggit/git_export_map.json`
+Location: `.aggit/git_export_map.json`
 
-Mapeia o estado exportado para os commits equivalentes no Git local.
+Maps AgGit revisions to equivalent commit SHAs on the local Git repository.
 
-### 5.1 Formato da Chave Composta
-Para garantir rastreabilidade, continuidade de branch e independência entre ramificações, a chave do ledger segue a estrutura:
+### 5.1 Composite Key Structure
+To ensure lineage traceability, branch continuity, and multi-branch isolation, ledger keys follow a composite structure:
 ```
 <revision_id>::<git_branch>::<parent_git_commit>
 ```
-Exemplo:
+Example:
 ```json
 {
   "c9bf9e57-1685-4c89-bafb-ff5af830be8a::feature/agent-sprint::": "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
@@ -134,11 +136,11 @@ Exemplo:
 
 ---
 
-## 6. Manifesto de Materialização no Disco
+## 6. On-Disk Materialization Manifest
 
-Localização: `.aggit/materialized_state.json`
+Location: `.aggit/materialized_state.json`
 
-Registra a relação de arquivos gravados no diretório de trabalho na última materialização bem-sucedida, permitindo a detecção de edições locais em 3 estados:
+Tracks the physical manifest of files written to the working tree during the last successful materialization, enabling 3-state pre-flight protection:
 ```json
 {
   "tracked_files": {

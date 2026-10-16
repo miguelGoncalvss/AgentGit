@@ -14,6 +14,7 @@ O **AgGit** é um sistema de controle de versão moderno projetado especificamen
 ## 📑 Sumário
 
 - [Visão Geral e Conceitos](#-visão-geral-e-conceitos)
+- [Como o AgGit Funciona e Fluxo de Arquitetura](#-como-o-aggit-funciona-e-fluxo-de-arquitetura)
 - [Garantias de Concorrência e Persistência](#-garantias-de-concorrência-e-persistência)
 - [Requisitos e Instalação](#-requisitos-e-instalação)
 - [Guia de Uso Rápido](#-guia-de-uso-rápido)
@@ -36,6 +37,27 @@ Para evitar as ambiguidades comuns em sistemas distribuídos, o AgGit adota term
 - **Revisão (`tx_id`)**: Um identificador imutável (UUID v4) de uma transação publicada no journal, contendo metadados, autores, base e alterações de arquivos.
 - **Base de Revisão (`base_revision`)**: O identificador exato da revisão a partir da qual o agente iniciou seu trabalho. Impede que merges assumam bases vazias ou ancestrais incorretos.
 - **Checkpoint**: Um snapshot derivado e recuperável (`.aggit/checkpoints/latest.json`) que registra a fronteira causal incorporada até o momento, permitindo reconciliação incremental em tempo constante.
+
+---
+
+## 🔄 Como o AgGit Funciona e Fluxo de Arquitetura
+
+> [!IMPORTANT]
+> **O AgGit é uma camada de versionamento e sincronização projetada para receber e coordenar alterações de múltiplos agentes.**  
+> **Ele NÃO executa nem gerencia os agentes de IA diretamente:** seus agentes autônomos, processos em background ou orquestradores (ex: LangChain, CrewAI, AutoGen, scripts customizados) simplesmente chamam a API em Python/Rust ou a CLI do projeto para registrar e comitar seu trabalho.
+
+<p align="center">
+  <img src="../img/mermaid-diagram.png" alt="Fluxo de Trabalho do AgGit" width="460" />
+</p>
+
+### Ciclo Prático de Trabalho Multi-Agente:
+1. **Agentes e sessões**: Vários agentes de IA operam simultaneamente em contextos de sessão isolados sem travar ou concorrer pelo mesmo arquivo de índice.
+2. **Staging separado**: Cada par `(agent_id, session_id)` grava em sua própria área virtual de staging (`.aggit/staging/`), eliminando totalmente as disputas por lock no `.git/index`.
+3. **Conteúdo e transações em `.aggit`**: Blobs de conteúdo imutáveis (CAS) e transações em diário append-only (`.aggit/journal/`) registram o progresso atomicamente sem bloqueios globais.
+4. **Reconciliação**: A reconciliação semântica de 3 vias periódica ou sob demanda mescla edições de texto ortogonais e chaves JSON independentes sem intervenção humana.
+5. **Resolução explícita de conflitos (`Conflitos` ➔ `Resolução explícita`)**: Se houver edições concorrentes na mesma linha ou exclusões conflitantes, os conflitos recebem identidade determinística e permanecem pendentes no checkpoint até resolução via `aggit resolve`.
+6. **Exportação para branch Git**: Estados reconciliados e limpos são exportados em worktrees isolados para branches dedicadas do Git sem interferir no workspace local do desenvolvedor.
+7. **Push e PR no GitHub**: Publicação explícita de branches e abertura ou atualização de Pull Requests via GitHub CLI (`gh`).
 
 ---
 

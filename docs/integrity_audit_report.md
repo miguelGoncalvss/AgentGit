@@ -1,101 +1,93 @@
-# Relatório de Auditoria de Integridade, Concorrência e Exportação (AgGit)
+# Integrity, Concurrency & Git Export Audit Report (AgGit)
 
-**Data:** 15 de Outubro de 2026  
-**Ambiente de Execução:** Windows 11 Pro x64, AMD/Intel Multi-Core, SSD NVMe PCIe Gen4, Python 3.13.7, Rust 1.99.0, Git 2.49.0  
-**Branch de Trabalho:** `fix/aggit-deep-integrity-windows-and-export`  
-**Referência Comparativa:** Commit `309df61c45a36357adc0d7326aa4836143e2586e`
+🌐 **Translations / Idiomas:** English | [Português (Brasil)](translations/integrity_audit_report.pt-BR.md) | [Español](translations/integrity_audit_report.es.md)
+
+**Date:** October 15, 2026  
+**Execution Environment:** Windows 11 Pro x64, AMD/Intel Multi-Core, NVMe PCIe Gen4 SSD, Python 3.13.7, Rust 1.99.0, Git 2.49.0  
+**Working Branch:** `fix/aggit-deep-integrity-windows-and-export`  
+**Reference Comparison:** Commit `309df61c45a36357adc0d7326aa4836143e2586e`
 
 ---
 
-## 1. Análise Comparativa: HEAD vs. `309df61c45a36357adc0d7326aa4836143e2586e`
+## 1. Comparative Analysis: HEAD vs. `309df61c45a36357adc0d7326aa4836143e2586e`
 
-| Área Auditada | Estado em `309df61c45a36357adc0d7326aa4836143e2586e` | Estado no HEAD Atual (`fix/aggit-deep-integrity-windows-and-export`) |
+| Audited Area | State in `309df61c45a36357adc0d7326aa4836143e2586e` | State in Current HEAD (`fix/aggit-deep-integrity-windows-and-export`) |
 | :--- | :--- | :--- |
-| **Validação de Caminhos no Windows** | `_validate_safe_path` entrava em loop infinito ao inspecionar junctions/symlinks porque `os.path.dirname("C:\\") == "C:\\"`. Verificação de prefixo (`target.startswith(base)`) permitia escape para diretórios irmãos (ex: `/work_external` aceito a partir de `/work`). | Implementado `is_path_contained` com `os.path.commonpath` e `os.path.normcase`, garantindo verificação estrita por componentes de diretório. Adicionada guarda explícita de terminação na raiz do sistema de arquivos (`parent == cur`). |
-| **Matriz de Exportação Git (3-Way)** | Cenários de divergência humana na branch de exportação falhavam: AgGit deletando arquivo modificado por humano apagava o arquivo sem conflito; AgGit modificando arquivo deletado por humano recriava o arquivo silenciosamente; adições concorrentes divergentes eram sobrescritas; e exportações sucessivas revertiam alterações humanas previamente integradas. | Implementada matriz completa de divergência de 3 vias em `prepare_export_plan`: detecta conflitos `modify_delete`, `delete_modify` e `add_add_divergence`. Exportações sucessivas realizam merge de 3 vias usando `last_aggit_bytes` (base), `cur_git_bytes` (ponta Git com edições integradas) e `cur_aggit_bytes` (novo estado AgGit). |
-| **Identidade e Ciclo de Vida de Conflitos** | Conflitos utilizavam UUID aleatório ou SHA sem ordenação determinística de versões. Resolução de um conflito antigo podia limpar indevidamente um conflito concorrente recém-adicionado no mesmo arquivo. | Identidade calculada deterministicamente via SHA-256 (`file_path::internal_path::conflict_type::base_sha::sorted(a_sha, b_sha)`). `resolve_conflict` recebe `target_conflict_ids` e a reconciliação filtra estritamente os conflitos direcionados, preservando conflitos não resolvidos de terceiros agentes. |
-| **Auto-reparação de Índices e Dry-Run Estrito** | Se `journal_index.json` estivesse corrompido, defasado ou ausente, novas instâncias do engine falhavam em carregar o histórico. Chamadas em dry-run (`preview_export`) causavam mutações no disco ao regenerar índices ou persistir checkpoints. | Implementado modo `read_only` no `Journal`. `_load_index` detecta automaticamente ausência ou defasagem do índice em relação aos arquivos de transação e auto-repara em memória. Chamadas em dry-run garantem **zero mutações no disco** (sem gravação de blobs CAS, checkpoints ou índices). |
-| **Escalabilidade da Reconciliação** | Reconciliação de transações consecutivas recalculava a árvore completa a partir da raiz percorrendo todo o histórico de transações ($O(N^2)$ em acessos a disco). | Implementada memoização de revisões em memória e caminho rápido incremental via delta do commit pai imediato em `get_revision_tree`. Leituras repetidas do histórico durante a reconciliação foram eliminadas. |
-| **Hardening de CI Workflows** | Workflow do GitHub Actions executava arquivos de teste individuais codificados manualmente, não descobria novos testes de integridade e não possuía timeouts, permitindo travamentos silenciosos. | CI atualizado com `timeout-minutes: 15` no job e nos steps de execução. Runner configurado para descoberta automática completa via `python -m unittest discover -s tests -v`. |
-| **Verificação Estrita de Benchmarks** | `benchmark.py` utilizava verificações superficiais (`exists`, `startswith`) e mantinha fallback para o binário estático `aggit.exe` na raiz do repositório. O benchmark Rust nativo não validava conteúdo em bytes. | Verificação estrita byte-a-byte por SHA-256 de todas as saídas físicas em disco em todos os motores (Python, Rust e Git worktrees). Fallback para executável versionado removido; binário Rust é estritamente compilado a partir dos fontes (`aggit-rs/target/release/aggit.exe`). |
+| **Windows Path Validation** | `_validate_safe_path` entered infinite loops on junction/symlink evaluation because `os.path.dirname("C:\\") == "C:\\"`. Prefix checking (`target.startswith(base)`) allowed directory escapes to sibling folders (e.g. `/work_external` accepted under `/work`). | Implemented `is_path_contained` using `os.path.commonpath` and `os.path.normcase`, ensuring strict component-wise path containment. Added explicit root loop break (`parent == cur`). |
+| **Git Export 3-Way Matrix** | Human divergence scenarios on the export branch failed: AgGit deleting a file modified by a human deleted the file without conflict; AgGit modifying a file deleted by a human silently recreated it; conflicting concurrent additions were overwritten; and sequential exports reverted integrated human edits. | Full 3-way divergence matrix implemented in `prepare_export_plan`: detects `modify_delete`, `delete_modify`, and `add_add_divergence` conflicts. Sequential exports perform 3-way merges comparing `last_aggit_bytes` (base), `cur_git_bytes` (Git branch tip with integrated human edits), and `cur_aggit_bytes` (new AgGit state). |
+| **Conflict Identity & Lifecycle** | Conflicts used non-deterministic UUIDs or SHAs without sorted version ordering. Resolving an older conflict could mistakenly dismiss newly introduced concurrent conflicts on the same path. | Conflict ID is deterministically generated via SHA-256 (`file_path::internal_path::conflict_type::base_sha::sorted(a_sha, b_sha)`). `resolve_conflict` takes `target_conflict_ids` and reconciliation filters only the targeted conflicts, preserving unresolved concurrent conflicts from other agents. |
+| **Auto-Healing Persistence & Pure Dry-Run** | If `journal_index.json` was missing or lagging behind journal files, new engine instances failed to load recent history. Dry-run calls (`preview_export`) caused disk mutations by saving checkpoints or regenerating indices. | Added `read_only` mode to `Journal`. `_load_index` detects missing or out-of-sync indices and auto-heals in memory from transaction files. Dry-run guarantees **zero disk mutations** (no temporary CAS blobs, checkpoints, or indices written). |
+| **Reconciliation Scalability** | Sequential transaction reconciliation recomputed full trees from root by scanning the entire journal history ($O(N^2)$ disk reads). | Implemented revision tree memoization and incremental fast-path deltas against the immediate parent commit in `get_revision_tree`, eliminating redundant quadratic transaction reads. |
+| **CI Workflow Hardening** | Actions workflow ran hardcoded individual test scripts, failed to discover newly added test suites, and lacked job timeouts. | CI updated with `timeout-minutes: 15` on jobs and steps. Test runner configured for full automatic discovery via `python -m unittest discover -s tests -v`. |
+| **Strict Benchmark Verification** | `benchmark.py` relied on weak existence and prefix checks (`exists`, `startswith`) and maintained a fallback to a stale root binary. Rust benchmarks lacked byte verification. | Strict byte-by-byte SHA-256 verification of all output files across Python, Rust, and Git worktrees. Stale binary fallback removed; the native Rust binary is strictly built from sources in `aggit-rs/target/release/aggit.exe`. |
 
 ---
 
-## 2. Arquivos Modificados e Novas Implementações
+## 2. Modified Files & Key Implementations
 
 1. **`aggit/path_utils.py`**:
-   - Adicionada função `is_path_contained(parent_dir, target_path)` utilizando `os.path.realpath`, `os.path.normcase` e `os.path.commonpath`.
-   - Endurecida `sanitize_repo_path` contra caminhos UNC, dispositivos reservados Windows e prefixos de drive.
+   - Added `is_path_contained(parent_dir, target_path)` with `os.path.realpath`, `os.path.normcase`, and `os.path.commonpath`.
+   - Hardened `sanitize_repo_path` against UNC paths, Windows reserved devices, and drive prefixes.
 2. **`aggit/git_bridge.py`**:
-   - `_validate_safe_path`: adicionada quebra explícita de loop na raiz (`parent == curr`) e validação via `is_path_contained`.
-   - `prepare_export_plan`: implementada matriz de 3 vias cobrindo cenários A, B e C, e preservação de edições humanas integradas em exportações sucessivas.
-   - Cálculo de hash compatível com CAS (`blob <len>\0...`) ao referenciar árvores de exportação.
-   - Proteção de `journal.read_only = True` durante `preview_export` e `prepare_export_plan`.
+   - `_validate_safe_path`: explicit filesystem root break (`parent == curr`) and `is_path_contained` validation.
+   - `prepare_export_plan`: 3-way matrix covering scenarios A, B, and C, preserving integrated human edits across successive exports.
+   - CAS-compatible SHA computation (`blob <len>\0...`) for export tree blobs.
+   - Guarded with `journal.read_only = True` during `preview_export` and `prepare_export_plan`.
 3. **`aggit/semantic_merge.py`**:
-   - Atualizado `MergeConflict.compute_conflict_id` para computação estritamente determinística com shas de versão ordenados.
-   - `merge_files`: atribuição de `base_sha`, `a_sha`, `b_sha` e recálculo de identidade para todas as divergências.
+   - `MergeConflict.compute_conflict_id` with deterministic SHA-256 hash and sorted version SHAs.
+   - Assigned `base_sha`, `a_sha`, and `b_sha` across all divergence paths.
 4. **`aggit/engine.py`**:
-   - `resolve_conflict`: suporte a `target_conflict_ids` com gravação nos metadados de resolução.
-   - `reconcile_state`: filtragem granular por `target_conflict_ids`, retenção de conflitos concorrentes no mesmo caminho.
-   - Memoização em `get_revision_tree` e fast-path incremental de pai para linearizar o custo de reconciliação.
+   - `resolve_conflict`: supports `target_conflict_ids` stored in metadata.
+   - `reconcile_state`: granular filtering by `target_conflict_ids`, preserving concurrent conflicts.
+   - Linearized reconciliation through revision memoization in `get_revision_tree`.
 5. **`aggit/journal.py`**:
-   - Suporte a `read_only`.
-   - Auto-reparação do índice (`_load_index`) ao detectar divergência entre a lista de arquivos de transação e `journal_index.json`.
+   - Added `read_only` mode.
+   - Auto-healing in `_load_index` when transaction files diverge from `journal_index.json`.
 6. **`aggit-rs/src/semantic.rs`**:
-   - Implementado `compute_conflict_id` e `recompute_id` com hash SHA-256 e ordenação determinística de versões.
-   - Anexação de metadados de versões em todos os ramos de divergência (`modify_delete`, `binary`, `json_key`, texto).
+   - Implemented `compute_conflict_id` and `recompute_id` with SHA-256 and sorted versions.
+   - Attached version metadata across all conflict branches (`modify_delete`, `binary`, `json_key`, text).
 7. **`aggit-rs/src/engine.rs`**:
-   - `conflicts_by_path` migrado para `HashMap<String, Vec<MergeConflict>>`.
-   - `resolve_conflict` atualizado com parâmetro `target_conflict_ids`.
-   - `materialize`: sanitização de caminhos antigos e novos antes de operações no sistema de arquivos.
+   - Migrated `conflicts_by_path` to `HashMap<String, Vec<MergeConflict>>`.
+   - Updated `resolve_conflict` with `target_conflict_ids`.
+   - Path sanitization in `materialize` before filesystem operations.
 8. **`aggit-rs/src/main.rs`**:
-   - Subcomando `benchmark`: validação física estrita dos bytes esperados em cada arquivo de agente.
+   - Subcommand `benchmark`: strict byte-level verification for each worker payload.
 9. **`benchmark.py`**:
-   - Gravação em modo binário (`wb`) para neutralizar conversão CRLF/LF no Windows.
-   - Validação estrita byte-a-byte para Python, Rust e Git worktrees.
-   - Remoção de fallback para executável versionado; compilação e execução estrita a partir dos fontes.
+   - Binary write mode (`wb`) to eliminate CRLF/LF line-ending translations on Windows.
+   - Strict byte-level equality validation for Python, Rust, and Git worktrees.
+   - Source compilation from `aggit-rs/target/release/`.
 10. **`.github/workflows/ci.yml`**:
-    - Substituição de chamadas manuais por `python -m unittest discover -s tests -v`.
-    - Adição de `timeout-minutes: 15`.
-11. **`tests/test_deep_integrity_v2.py`** *(novo)*:
-    - 10 cenários de regressão e estresse cobrindo:
-      - Terminação em junctions/symlinks no Windows.
-      - Bloqueio de escapes para diretórios irmãos com prefixo compartilhado.
-      - Cenário A: AgGit del vs Human mod -> conflito `modify_delete`.
-      - Cenário B: AgGit mod vs Human del -> conflito `modify_delete`.
-      - Cenário C: Add vs Add divergente -> conflito `add_add_divergence`.
-      - Exportações sucessivas preservando alterações humanas integradas.
-      - Identidade determinística de conflito e rejeição de resolução obsoleta.
-      - Auto-recuperação de índices de transação ausentes ou defasados.
-      - Isolamento estrito de dry-run (zero escritas em disco com índice ausente).
-      - Reconciliação com escala linear.
+    - Automatic discovery with `python -m unittest discover -s tests -v`.
+    - Added `timeout-minutes: 15`.
+11. **`tests/test_deep_integrity_v2.py`** *(new)*:
+    - 10 regression scenarios verifying Windows symlink termination, directory escape blocks, export matrix A/B/C, index auto-healing, pure dry-runs, and linear reconciliation scaling.
 
 ---
 
-## 3. Metodologia e Resultados dos Benchmarks
+## 3. Benchmark Methodology & Results
 
-Executado em ambiente Windows 11 (SSD NVMe PCIe Gen4, 8 threads concorrentes, Python 3.13, Rust 1.99, Git 2.49):
+Executed on Windows 11 Pro (NVMe PCIe Gen4 SSD, 8 concurrent threads, Python 3.13, Rust 1.99, Git 2.49):
 
-| Sistema Testado | Sucesso | Taxa de Erro | Tempo Total (s) | Throughput (ops/s) | Latência p50 | Latência p95 | Conteúdo Verificado |
+| Tested System | Success | Error Rate | Total Time (s) | Throughput (ops/s) | Latency p50 | Latency p95 | Content Verified |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Git (Shared Index)** | 4/20 | **80.0%** | 0.52s | 7.71 | 107ms | 182ms | Sim (4 arquivos) |
-| **Git (Worktree por Agente)** | 20/20 | 0.0% | 1.23s | 16.27 | 359ms | 417ms | Sim (100% íntegro) |
-| **AgGit (Python Engine)** | 20/20 | **0.0%** | 0.88s | 22.66 | 107ms | 490ms | Sim (100% íntegro) |
-| **AgGit (Rust Native Engine)** | 20/20 | **0.0%** | **0.09s** | **214.50** | **18ms** | **22ms** | Sim (100% íntegro) |
+| **Git (Shared Index)** | 4/20 | **80.0%** | 0.52s | 7.71 | 107ms | 182ms | Yes (4 files) |
+| **Git (Worktree per Agent)** | 20/20 | 0.0% | 1.23s | 16.27 | 359ms | 417ms | Yes (100% verified) |
+| **AgGit (Python Engine)** | 20/20 | **0.0%** | 0.88s | 22.66 | 107ms | 490ms | Yes (100% verified) |
+| **AgGit (Rust Native Engine)** | 20/20 | **0.0%** | **0.09s** | **214.50** | **18ms** | **22ms** | Yes (100% verified) |
 
-### Destaques de Desempenho:
-- O **Git com índice compartilhado** falhou em 80% das requisições devido à contenção de trava no arquivo `.git/index.lock`.
-- O **Git com worktrees dedicados** concluiu todas as operações, porém a sobrecarga de criação de branches e I/O de diretórios resultou em latência $p_{95}$ de 417ms.
-- O **AgGit (Python Engine)** superou o Git worktrees com 22.66 ops/s e 0.88s de tempo total (incluindo commit, reconciliação e materialização física no disco).
-- O **AgGit (Rust Native Engine)** atingiu **214.50 ops/s** e latência $p_{50}$ de apenas **18ms** (**13.2x mais rápido** que o Git worktrees), com verificação estrita de conteúdo 100% aprovada.
+### Performance Highlights:
+- **Git with Shared Index** failed 80% of transactions due to `.git/index.lock` contention.
+- **Git with Worktrees** attained 100% success, but file-system directory and branch overhead pushed $p_{95}$ latency to 417ms.
+- **AgGit (Python Engine)** outperformed Git worktrees at 22.66 ops/s and 0.88s total duration.
+- **AgGit (Rust Native Engine)** achieved **214.50 ops/s** and a $p_{50}$ latency of **18ms** (**13.2x faster** than Git worktrees) with 100% byte-verified data integrity.
 
 ---
 
-## 4. Cobertura da Suíte de Testes Automatizados
+## 4. Automated Test Suite Coverage
 
-- **Suíte Python Completa (`python -m unittest discover -s tests -v`):**
-  - **50 testes executados, 50 aprovados** (1 teste de symlinks externos ignorado por falta de privilégio elevado de desenvolvedor no Windows).
-  - Tempo total de execução: ~22.7 segundos.
-- **Suíte Rust Nativa (`cargo test --manifest-path aggit-rs/Cargo.toml`):**
-  - **13 testes de integração executados, 13 aprovados**.
-  - Tempo total de execução: ~0.33 segundos.
+- **Complete Python Test Suite (`python -m unittest discover -s tests -v`):**
+  - **50 tests executed, 50 passed** (1 external symlink test skipped due to non-elevated user environment on Windows).
+  - Total execution duration: ~22.7 seconds.
+- **Native Rust Integration Suite (`cargo test --manifest-path aggit-rs/Cargo.toml`):**
+  - **13 integration tests executed, 13 passed**.
+  - Total execution duration: ~0.33 seconds.

@@ -1,40 +1,41 @@
-# Guia de Compatibilidade e Migração de Formatos
+# Format Compatibility & Migration Guide
 
-O AgGit foi projetado para manter retrocompatibilidade com repositórios e eventos criados em versões anteriores.
+🌐 **Translations / Idiomas:** English | [Português (Brasil)](translations/migration.pt-BR.md) | [Español](translations/migration.es.md)
+
+AgGit is designed to ensure strict backward compatibility with repositories and event streams generated in prior versions.
 
 ---
 
-## 1. Evolução do Formato de Eventos
+## 1. Event Format Evolution
 
-| Campo | Schema v1 (Legado) | Schema v2 (Canônico Atual) |
+| Field | Schema v1 (Legacy) | Schema v2 (Current Canonical) |
 | :--- | :--- | :--- |
-| **Identificador (`tx_id`)** | 8 caracteres truncados | UUID v4 completo (36 caracteres) |
-| **Registro de Arquivos** | Dicionário plano `files: {path: sha}` | Dicionário estruturado `changes: {path: {action, blob_sha, old_sha}}` |
-| **Exclusões** | Ausência implícita de chave | Ação explícita `"action": "delete"` |
-| **Revisão Base** | Ausente (herdava HEAD linear) | `base_revision: "uuid"` explícito |
-| **Identidade de Sessão** | Apenas `agent_id` | `session_id` desacoplado de `agent_id` |
-| **Carimbo de Tempo** | Float em segundos | String ISO-8601 UTC + `timestamp_ns` (i64) |
+| **Identifier (`tx_id`)** | 8 truncated characters | Full 36-character UUID v4 |
+| **File Records** | Flat dictionary `files: {path: sha}` | Structured dictionary `changes: {path: {action, blob_sha, old_sha}}` |
+| **Deletions** | Implicit key absence | Explicit action `"action": "delete"` |
+| **Base Revision** | None (inherited linear HEAD) | Explicit `base_revision: "uuid"` |
+| **Session Identity** | Only `agent_id` | `session_id` decoupled from `agent_id` |
+| **Timestamp** | Float seconds | ISO-8601 UTC string + `timestamp_ns` (i64) |
 
 ---
 
-## 2. Como a Migração Ocorre
+## 2. Transparent Migration Mechanism
 
-1. **Leitura Transparente**:
-   Ao ler um evento sem o campo `"schema_version"` ou com `"schema_version": 1`, os leitores Python (`TransactionRecord.from_dict`) e Rust (`Transaction::get_effective_changes`) convertem automaticamente o dicionário `files` em registros de modificação (`action="modify"`).
-2. **Preservação de Dados Duráveis**:
-   Eventos legados no journal `.aggit/journal/` não são reescritos nem destruídos. Novos commits geram eventos no schema v2.
-3. **Compatibilidade dos Blobs CAS**:
-   O formato dos objetos armazenados no CAS (`.aggit/objects/`) permanece 100% idêntico entre v1 e v2: cabeçalho `[tipo] [tamanho]\0` comprimido com zlib e endereçado por SHA-256.
+1. **Transparent Ingestion**:
+   When reading events without `"schema_version"` or carrying `"schema_version": 1`, both Python (`TransactionRecord.from_dict`) and Rust (`Transaction::get_effective_changes`) readers automatically transform legacy `files` dictionaries into modification records (`action="modify"`).
+2. **Durability of Historic Events**:
+   Existing transactions in `.aggit/journal/` are never overwritten or mutated. New commits append records conforming to schema v2.
+3. **CAS Blob Compatibility**:
+   Object storage format in `.aggit/objects/` is 100% identical across schemas: header `[type] [size]\0` compressed with zlib and addressed by SHA-256.
 
 ---
 
-## 3. Evolução dos Checkpoints e Auto-recuperação
+## 3. Checkpoint Evolution & Self-Healing
 
-### 3.1 Checkpoints Legados (Schema v1)
-No schema v1 de checkpoints (`.aggit/checkpoints/latest.json`), o arquivo registrava apenas `tree` e `processed_tx_ids`. Se um conflito ocorresse em execuções antigas, ele não era persistido estruturadamente, arriscando perda de contexto em reinicializações de processo.
+### 3.1 Legacy Checkpoints (Schema v1)
+In schema v1 (`.aggit/checkpoints/latest.json`), checkpoints recorded only `tree` and `processed_tx_ids`. Unresolved conflicts were not persisted as structured entities, creating the risk of lost conflict context upon process restarts.
 
-### 3.2 Migração para Checkpoint Schema v2
-- **Compatibilidade de Leitura**: Ao carregar um checkpoint sem o campo `"pending_conflicts"`, o motor atribui automaticamente uma lista vazia `[]`, mantendo compatibilidade direta.
-- **Detecção e Preservação**: Novos conflitos detectados durante a reconciliação são persistidos estruturadamente no schema v2 com metadados completos (`path`, `base_sha`, `ours_sha`, `theirs_sha`, `conflict_type`).
-- **Auto-recuperação Baseada no Journal**: Caso um checkpoint antigo tenha sido gravado de forma inconsistente ou corrompido, a recuperação utiliza o append-only journal (`.aggit/journal/`) como fonte imutável da verdade. Ao apagar ou invalidar o arquivo de checkpoint, a execução de `aggit reconcile` reprocessa o histórico causal segundo o DAG de transações, restabelecendo a árvore unificada e re-detectando quaisquer conflitos não resolvidos.
-
+### 3.2 Upgrading to Checkpoint Schema v2
+- **Reader Backward Compatibility**: Loading checkpoints missing the `"pending_conflicts"` key safely initializes an empty list `[]`.
+- **Structured Preservation**: Divergences identified during 3-way reconciliation persist with rich context (`path`, `base_sha`, `ours_sha`, `theirs_sha`, `conflict_type`).
+- **Journal-Based Self-Healing**: If a checkpoint is corrupted or out of sync, the engine uses the append-only journal (`.aggit/journal/`) as the immutable ground truth. Removing or invalidating the checkpoint causes `aggit reconcile` to recalculate the DAG state, restoring the unified tree and accurately repopulating all pending conflicts.
